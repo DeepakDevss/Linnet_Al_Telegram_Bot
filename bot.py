@@ -435,6 +435,9 @@ SYSTEM_PROMPT = (
     "are unsure, say so plainly instead of bluffing.\n"
     "- NEVER open with filler praise ('Great question!', 'Bilkul sahi pucha', 'Wah kya baat'). "
     "Start with the answer.\n"
+    "- Do NOT be a yes-man. If you think they are wrong, or being unfair to themselves, say so "
+    "kindly and briefly, and say why. Agreeing with everything makes you useless. Disagree "
+    "with respect, never with contempt, and drop it if they have heard you.\n"
     "- Match length to the question: a small question gets a small answer. Only go long when the "
     "topic genuinely needs it.\n"
     "- If a request is genuinely ambiguous and guessing would waste their time, ask ONE short "
@@ -2719,6 +2722,8 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             MEM.count_ai(u.effective_user.id, text)
         except Exception as e:  # noqa: BLE001
             log.debug("memory write failed: %s", e)
+    # They answered, so a future proactive message is welcome again.
+    _PROACTIVE_PENDING.discard(u.effective_chat.id)
     if not _should_answer(u, c.bot):
         return
     # Abuse guards (see USER_BUSY / USER_DAILY_CAP above).
@@ -3176,6 +3181,9 @@ async def _cleanup_loop() -> None:
 # in, at most PROACTIVE_MAX_PER_DAY times, never during quiet hours, and never with guilt,
 # streaks or fake urgency. One '/proactive off' stops it for good.
 _PROACTIVE_SENT: dict = {}          # chat_id -> (day_key, count_today)
+# Chats we sent a proactive message to that the person has NOT answered yet. We never stack
+# a second one on top - silence is respect, not something to be chased.
+_PROACTIVE_PENDING: set = set()
 _FREE_SEARCH_URL = "https://html.duckduckgo.com/html/"
 
 
@@ -3270,9 +3278,14 @@ async def _proactive_loop(bot) -> None:
                         day_key, count = day, 0
                     if count >= PROACTIVE_MAX_PER_DAY:
                         continue
+                    if chat_id in _PROACTIVE_PENDING:
+                        log.info("proactive: %s has not replied to the last one - staying quiet",
+                                 chat_id)
+                        continue
                     try:
                         await _send_proactive(bot, chat_id)
                         _PROACTIVE_SENT[chat_id] = (day_key, count + 1)
+                        _PROACTIVE_PENDING.add(chat_id)   # wait for them to reply first
                     except Exception as e:  # noqa: BLE001
                         log.warning("proactive to %s failed: %s", chat_id, str(e)[:120])
                     await asyncio.sleep(5)       # never burst
