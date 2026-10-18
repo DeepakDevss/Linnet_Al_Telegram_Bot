@@ -116,15 +116,32 @@ _models_env = os.environ.get("GEMINI_MODELS", "").strip()
 # True when the chain came from the environment. A stale GEMINI_MODELS overrides the tuned
 # default (and often points at retired ids), so we say so loudly at startup and in /diag.
 GEMINI_MODELS_FROM_ENV = bool(_models_env)
+# Tuned chain, ordered by HOW MUCH FREE QUOTA each model gives - the model that can answer
+# the most requests per day goes first, the scarce ones are last-resort only.
+#
+# Verified against Google's own docs (Oct 2026):
+#   * gemini-2.5-* was REMOVED: Google now limits those to projects that already used them,
+#     so they return 404 NOT_FOUND for a new project (they were burning 2 attempts per reply).
+#   * gemini-flash-latest was REMOVED: it is a 'latest' alias, and Google's own forum says
+#     aliases point at the most congested endpoints.
+#   * 3.5/3.1 Flash-Lite = ~500 requests/day each; plain Flash models = ~20/day.
+#   * gemma-4 is free-only with a very large allowance (~9k/day), so it sits right after the
+#     two Lite models as a quota-saver.
+# Rough free-tier requests/day, for the /diag readout and for ordering decisions.
+MODEL_RPD = {
+    "gemini-3.5-flash-lite": "~500", "gemini-3.1-flash-lite": "~500",
+    "gemma-4-31b-it": "~9000", "gemma-4-26b-a4b-it": "~9000",
+    "gemini-3-flash-preview": "free", "gemini-3.6-flash": "~20",
+    "gemini-3.8-flash": "~20", "gemini-3.5-flash": "~20",
+}
 GEMINI_MODELS = [m.strip() for m in _models_env.split(",") if m.strip()] or [
-    "gemini-3.5-flash-lite",   # ~500 RPD
+    "gemini-3.5-flash-lite",   # ~500 RPD - the workhorse, most available
     "gemini-3.1-flash-lite",   # ~500 RPD
-    "gemma-4-31b-it",          # free-only tier (no paid tier at all)
-    "gemini-3.8-flash",        # ~20 RPD - last resort (best quality)
-    "gemini-3.6-flash",        # ~20 RPD - last resort
+    "gemini-3-flash-preview",  # free tier, proved OK on the live self-test
+    "gemma-4-31b-it",          # free-only tier, huge allowance (weaker, so lower down)
+    "gemini-3.6-flash",        # ~20 RPD - scarce
+    "gemini-3.8-flash",        # ~20 RPD - best quality, last resort
 ]
-if "gemini-flash-latest" not in GEMINI_MODELS:
-    GEMINI_MODELS.append("gemini-flash-latest")
 
 # ORDER MATTERS. gemini-3.8-flash-tts is Google's studio-grade TTS (#1 on Hume AI's
 # Voice Design benchmark) - the OLD 2.5-flash-preview-tts was first here, which is exactly
@@ -1738,11 +1755,32 @@ def _thinking_allowed(model: str) -> bool:
             and "gemma" not in (model or "").lower())
 
 
+def _is_gemma(model: str) -> bool:
+    """Gemma models are a different family: they do NOT accept system_instruction or a
+    thinking_config, which is why they came back blank on the self-test while still having a
+    very large free allowance. For them the system prompt is folded into the user message."""
+    return "gemma" in (model or "").lower()
+
+
+def _gemma_contents(contents, sys_instr: str):
+    """Fold the system prompt into the first user turn, for models without system_instruction."""
+    out, first = [], True
+    for c in contents:
+        parts = list(getattr(c, "parts", None) or [])
+        if first and parts:
+            head = types.Part.from_text(text=sys_instr + "\n\n---\n\n")
+            out.append(types.Content(role="user", parts=[head] + parts))
+            first = False
+        else:
+            out.append(c)
+    return out or contents
+
+
 def _gen_config(sys_instr: str, model: str = "", thinking: bool = True):
     """Build the request config. Thinking is minimised by default - it is the biggest
     source of reply delay. It is never allowed to be the reason a request fails: the
     caller retries the same model with no thinking config at all."""
-    kw = {"system_instruction": sys_instr}
+    kw = {} if _is_gemma(model) else {"system_instruction": sys_instr}
     if MAX_OUTPUT_TOKENS > 0:
         kw["max_output_tokens"] = MAX_OUTPUT_TOKENS
     if thinking and _thinking_allowed(model):
@@ -1834,7 +1872,19 @@ def _advance_rr(model: str) -> None:
 
 
 def _mark_fail(model: str, err: str) -> None:
-    cool = 90 if ("429" in err or "RESOURCE_EXHAUSTED" in err) else 300
+    """Park a model that just failed. The cooldown depends on WHY it failed:
+
+    * 503 UNAVAILABLE = the model is briefly out of capacity (Google's own guidance: it is NOT
+      a quota or key problem, the model just needs a moment). Parking it for 5 minutes threw
+      away a perfectly good model, so 503 gets a short ~45s rest.
+    * 429 = quota. A short rest cannot help; park it for a few minutes.
+    """
+    if "503" in err or "UNAVAILABLE" in err or "overload" in err.lower():
+        cool = 45
+    elif "429" in err or "RESOURCE_EXHAUSTED" in err:
+        cool = 90
+    else:
+        cool = 300
     _MODEL_COOLDOWN[model] = time.time() + cool
 
 
@@ -2017,9 +2067,10 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0):
             if deadline:
                 per_call = max(1.0, min(CALL_TIMEOUT, deadline - time.monotonic()))
             try:
+                _contents = _gemma_contents(contents, sys_instr) if _is_gemma(model) else contents
                 resp = await asyncio.wait_for(
                     client.aio.models.generate_content(
-                        model=model, contents=contents,
+                        model=model, contents=_contents,
                         config=_gen_config(sys_instr, model, thinking)),
                     timeout=per_call,
                 )
@@ -3465,6 +3516,8 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              f"Models: {', '.join(GEMINI_MODELS)}"
              + ("  ⚠️ from GEMINI_MODELS env - DELETE that variable to use the tuned default"
                 if GEMINI_MODELS_FROM_ENV else "  (tuned default)"),
+             "Free quota (approx): " + ", ".join(
+                 f"{m}={MODEL_RPD.get(m, '?')}/day" for m in GEMINI_MODELS[:4]),
              f"🔑 Groq: {bool(GROQ_API_KEY)} (chat fallback + Whisper)",
              f"🖼 Vision: {'on' if client is not None else 'off (no Gemini key)'}",
              f"🔊 TTS: {'on' if client is not None else 'off'} "
