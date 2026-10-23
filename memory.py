@@ -34,6 +34,9 @@ _OLD_MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 MAX_NOTES = int(os.environ.get("MEMORY_MAX_NOTES", "0") or "0")
 MAX_NOTE_LEN = int(os.environ.get("MEMORY_MAX_NOTE_LEN", "300") or "300")
 MAX_CHATS_PER_USER = int(os.environ.get("MEMORY_MAX_CHATS", "0") or "0")
+# A compact, LLM-written profile (see the bot's compaction job) - replaces a long list of raw
+# notes with one tidy summary. This is what actually gets injected into the prompt.
+MAX_PROFILE_LEN = int(os.environ.get("MEMORY_MAX_PROFILE_LEN", "900") or "900")
 
 _LOCK = threading.Lock()
 _DATA = {"users": {}, "chats": {}}
@@ -243,11 +246,62 @@ def user_summary(user_id) -> str:
     if ai:
         top = sorted(ai.items(), key=lambda kv: -kv[1])[:3]
         bits.append("AI they mention: " + ", ".join(f"{safe_mem(k, 30)} ({v})" for k, v in top))
+    prof = safe_mem(u.get("profile"), MAX_PROFILE_LEN)
+    if prof:
+        bits.append("profile: " + prof)
     likes = [safe_mem(x, 150) for x in (u.get("likes") or [])]
     likes = [x for x in likes if x]
     if likes:
         bits.append("notes about them: " + "; ".join(likes))
     return "What you remember about this person - " + " | ".join(bits) + "."
+
+
+# ---------------------------------------------------- per-user profile / compaction
+def raw_notes(user_id) -> list:
+    """The stored raw facts about ONE user (sanitized) - input to the compaction job."""
+    load()
+    u = _DATA["users"].get(str(user_id)) or {}
+    return [safe_mem(x, MAX_NOTE_LEN) for x in (u.get("likes") or []) if safe_mem(x, MAX_NOTE_LEN)]
+
+
+def notes_count(user_id) -> int:
+    load()
+    return len((_DATA["users"].get(str(user_id)) or {}).get("likes") or [])
+
+
+def get_profile(user_id) -> str:
+    load()
+    return str((_DATA["users"].get(str(user_id)) or {}).get("profile") or "")
+
+
+def set_profile(user_id, text) -> bool:
+    """Store a compact, LLM-written profile for ONE user (sanitized, capped)."""
+    t = safe_mem(text, MAX_PROFILE_LEN)
+    if not t or user_id is None:
+        return False
+    load()
+    uid = str(user_id)
+    with _LOCK:
+        u = _DATA["users"].setdefault(uid, {})
+        u["profile"] = t
+        u["profile_at"] = int(time.time())
+    save()
+    return True
+
+
+def clear_notes(user_id) -> int:
+    """Drop the raw notes once they have been folded into the profile. Returns how many."""
+    load()
+    uid = str(user_id)
+    with _LOCK:
+        u = _DATA["users"].get(uid)
+        if u is None:
+            return 0
+        n = len(u.get("likes") or [])
+        u["likes"] = []
+    if n:
+        save()
+    return n
 
 
 def user_basic(user_id) -> str:
@@ -267,6 +321,7 @@ def all_users() -> list:
     out = [{"id": uid, "name": u.get("name", "?"), "username": u.get("username"),
             "language": u.get("language"), "msgs": u.get("msgs", 0),
             "first_seen": u.get("first_seen"), "likes": u.get("likes") or [],
+            "profile": u.get("profile") or "",
             "ai": u.get("ai") or {}}
            for uid, u in _DATA["users"].items()]
     out.sort(key=lambda x: -(x.get("msgs") or 0))

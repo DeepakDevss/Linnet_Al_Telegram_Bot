@@ -106,6 +106,8 @@ Linnet_Al_Telegram_Bot/
 
 VIDEX keeps user and chat records in a JSON file, and the path is set through an environment variable. Writes happen atomically, so an interrupted write won't corrupt the file. The exact record layout is defined in `memory.py`.
 
+Memory is kept per user, keyed by their Telegram ID, and only ever injected into that person's own conversation — one person's facts are never shown to another. When enough notes accumulate, a background job merges and de-duplicates them into one short, clean profile. A user can see and wipe their own memory with `/memory` and `/forget`.
+
 **Important — the host filesystem is ephemeral.** On most free hosts (Render's free plan included) any change to the local filesystem is lost on every **redeploy, restart, and spin-down**. A free service also sleeps after a period of inactivity, and sleeping wipes the filesystem too. On Render's free plan you **cannot attach a persistent disk** — disks need a paid service. So on free hosting:
 
 - Keep the service awake (a keep-alive ping to `/health` every few minutes) so it does not sleep. This preserves memory between deploys.
