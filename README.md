@@ -1,15 +1,15 @@
-# Linnet | AI Companion
+# VIDEX | AI Companion
 
 A Telegram AI bot written in Python. It holds conversations, understands media, remembers users across sessions, and can reply with text or voice.
 
-- Bot: https://t.me/Linnet_Agents_Bot
-- Repository: https://github.com/DeepakDevss/Linnet_AI_Telegram
+- Bot: https://t.me/Linnet_Agents_Bot  (the handle keeps its old name; the bot itself is VIDEX)
+- Repository: https://github.com/DeepakDevss/Linnet_Al_Telegram_Bot
 
 ---
 
 ## Overview
 
-Linnet runs as a single Python process and talks to Telegram through the Bot API. Google Gemini is the main language model. Groq is used as a fallback chat provider and handles the speech-to-text side. User and chat state lives in a local JSON file managed by `memory.py`.
+VIDEX runs as a single Python process and talks to Telegram through the Bot API. Google Gemini is the main language model. Groq is used as a fallback chat provider and handles the speech-to-text side. User and chat state lives in a local JSON file managed by `memory.py`.
 
 The bot is meant to run as a long-lived service. It should work on any platform that can run a Python process and set environment variables.
 
@@ -40,8 +40,8 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 Clone the repo and install the dependencies:
 
 ```bash
-git clone https://github.com/DeepakDevss/Linnet_AI_Telegram.git
-cd Linnet_AI_Telegram
+git clone https://github.com/DeepakDevss/Linnet_Al_Telegram_Bot.git
+cd Linnet_Al_Telegram_Bot
 
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
@@ -86,12 +86,14 @@ Command handlers are registered in `bot.py`. Check that file for the full list o
 ## Project structure
 
 ```
-Linnet_AI_Telegram/
-├── bot.py              Main application logic
+Linnet_Al_Telegram_Bot/
+├── bot.py              Main application logic (kept as one file on purpose)
 ├── memory.py           Persistent JSON store for users and chats
 ├── requirements.txt    Python dependencies
 ├── env.example.txt     Environment variable template
+├── privacy-policy.md   Privacy policy
 ├── welcome.png         Image used in the group welcome message
+├── LICENSE             MIT
 └── README.md
 ```
 
@@ -99,19 +101,42 @@ Linnet_AI_Telegram/
 
 ## Memory
 
-Linnet keeps user and chat records in a JSON file, and the path is set through an environment variable. Writes happen atomically, so an interrupted write won't corrupt the file. The exact record layout is defined in `memory.py`.
+VIDEX keeps user and chat records in a JSON file, and the path is set through an environment variable. Writes happen atomically, so an interrupted write won't corrupt the file. The exact record layout is defined in `memory.py`.
 
-If your host uses an ephemeral filesystem, mount a persistent volume and point the memory file path at it. Otherwise records are lost on every restart.
+**Important — the host filesystem is ephemeral.** On most free hosts (Render's free plan included) any change to the local filesystem is lost on every **redeploy, restart, and spin-down**. A free service also sleeps after a period of inactivity, and sleeping wipes the filesystem too. On Render's free plan you **cannot attach a persistent disk** — disks need a paid service. So on free hosting:
+
+- Keep the service awake (a keep-alive ping to `/health` every few minutes) so it does not sleep. This preserves memory between deploys.
+- Accept that a redeploy still clears memory. For real durability, attach a persistent disk on a paid plan and point `MEMORY_FILE` at it.
+
+---
+
+## Deployment (Render free tier)
+
+- Build command: `pip install -r requirements.txt`
+- Start command: `python bot.py`  (not gunicorn/wsgi)
+- Delete the `GEMINI_MODELS` env var if it is set — a stale value overrides the tuned built-in chain.
+- Set `GROQ_API_KEY`, or Gemini rate limits leave the bot replying "busy".
+- Run exactly **one** instance. Two instances cause `telegram.error.Conflict` and dropped messages.
+- Free services sleep after ~15 minutes idle. Ping `/health` every 5 minutes from an uptime monitor to keep it awake (this also keeps memory alive).
+
+---
+
+## Failure modes
+
+- **LLM timeout / rate limit** — the model chain falls through to the next provider; if all fail the bot replies with a short "busy" message.
+- **Media download fails** — the message is still answered, with the attachment noted as unavailable.
+- **TTS fails** — the text reply is already sent, so the answer is not lost.
+- **Memory unavailable** — the bot still runs; it just has no long-term recall (see Memory above).
 
 ---
 
 ## Data handling
 
 - All user and chat records are stored locally in the memory file. There's no external database.
-- Message content goes to Google Gemini and, when fallback kicks in, to Groq. If you run Linnet in a regulated environment, review the provider policies that apply to you.
+- Message content goes to Google Gemini and, when fallback kicks in, to Groq. If you run VIDEX in a regulated environment, review the provider policies that apply to you.
 - Credentials come from environment variables and are not part of the repository.
 
-If you run Linnet as a public service, you are the data controller for the records it stores.
+If you run VIDEX as a public service, you are the data controller for the records it stores. See `privacy-policy.md`.
 
 ---
 
@@ -145,4 +170,4 @@ Deepak Devs
 
 ## License
 
-There's no license file yet. Add one before you distribute or publicly modify this project.
+MIT — see `LICENSE`.

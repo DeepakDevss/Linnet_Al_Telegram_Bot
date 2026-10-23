@@ -30,12 +30,11 @@ Env vars (best practice: leave the *_MODELS ones UNSET and let the built-in chai
   BOT_TOKEN          (required)  BotFather token
   GEMINI_API_KEY     (required)  Google AI Studio free key
   GEMINI_MODELS      (optional)  ordered by free daily quota; built-in default:
-                                 gemini-3.5-flash-lite, gemini-3.1-flash-lite, gemma-4-31b-it,
-                                 gemini-3.8-flash, gemini-3.6-flash, gemini-flash-latest
+                                 gemini-3.5-flash-lite, gemini-3.1-flash-lite, gemini-3-flash-preview,
+                                 gemma-4-31b-it, gemini-3.6-flash, gemini-3.8-flash
   GROQ_API_KEY       (optional)  Groq free fallback (chat) + Whisper (voice-to-text)
-  GROQ_MODELS        (optional)  default: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.6-27b
-  TTS_MODELS         (optional)  default: gemini-3.8-flash-tts, gemini-3.8-flash-lite-tts,
-                                 gemini-2.5-flash-preview-tts
+  GROQ_MODELS        (optional)  default: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b
+  TTS_MODELS         (optional)  default: gemini-3.8-flash-tts, gemini-3.8-flash-lite-tts
   TTS_VOICE          (optional)  default: Leda (warm / conversational / youthful)
                                  others: Kore (firm), Puck (upbeat), Zephyr (bright), Sulafat (warm),
                                          Despina (smooth), Achernar (soft), Aoede (breezy), Charon (clear)
@@ -122,17 +121,20 @@ GEMINI_MODELS_FROM_ENV = bool(_models_env)
 # Verified against Google's own docs (Oct 2026):
 #   * gemini-2.5-* was REMOVED: Google now limits those to projects that already used them,
 #     so they return 404 NOT_FOUND for a new project (they were burning 2 attempts per reply).
+#   * gemini-3.5-flash / gemini-3.7-flash are DEPRECATED: Google auto-routes them to 3.6/3.8,
+#     so they are not kept in the chain or in the quota table below.
 #   * gemini-flash-latest was REMOVED: it is a 'latest' alias, and Google's own forum says
 #     aliases point at the most congested endpoints.
-#   * 3.5/3.1 Flash-Lite = ~500 requests/day each; plain Flash models = ~20/day.
-#   * gemma-4 is free-only with a very large allowance (~9k/day), so it sits right after the
-#     two Lite models as a quota-saver.
-# Rough free-tier requests/day, for the /diag readout and for ordering decisions.
+#   * gemma-4 is free-only with a very large allowance, so it sits after the two Lite models
+#     as a quota-saver.
+# NOTE: Google no longer publishes per-model free-tier requests/day (RPD). The real numbers
+# live in Google AI Studio for YOUR project, so the values below are ROUGH, dated hints used
+# only to order the chain and for the /diag readout - never a guarantee.
 MODEL_RPD = {
     "gemini-3.5-flash-lite": "~500", "gemini-3.1-flash-lite": "~500",
-    "gemma-4-31b-it": "~9000", "gemma-4-26b-a4b-it": "~9000",
+    "gemma-4-31b-it": "large", "gemma-4-26b-a4b-it": "large",
     "gemini-3-flash-preview": "free", "gemini-3.6-flash": "~20",
-    "gemini-3.8-flash": "~20", "gemini-3.5-flash": "~20",
+    "gemini-3.8-flash": "~20",
 }
 GEMINI_MODELS = [m.strip() for m in _models_env.split(",") if m.strip()] or [
     "gemini-3.5-flash-lite",   # ~500 RPD - the workhorse, most available
@@ -295,7 +297,13 @@ TTS_MIN_TAIL = 140                                                        # merg
 BUSY_MSG = ("🌸 VIDEX is a little busy right now. "
             "Please try again in a minute or two.")
 
-WELCOME_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome.png")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# welcome.png may live next to bot.py (default) or inside an assets/ folder. Try both, so
+# moving the image never silently breaks the group welcome.
+WELCOME_IMAGE = next(
+    (p for p in (os.path.join(_HERE, "welcome.png"),
+                 os.path.join(_HERE, "assets", "welcome.png")) if os.path.exists(p)),
+    os.path.join(_HERE, "welcome.png"))
 MEMBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "members.json")
 
 RULES = os.environ.get("GROUP_RULES", "").strip() or (
@@ -4149,15 +4157,19 @@ def resolve_models() -> None:
         bad = [m for m in GEMINI_MODELS if m not in names]
         extra = sorted(n for n in names
                        if ("flash" in n or "gemma" in n)
-                       and not any(s in n for s in skip) and n not in valid)
+                       and not any(s in n for s in skip) and n not in valid
+                       # 'latest' aliases point at Google's most congested endpoint, so they
+                       # are never auto-added as a safety-net model.
+                       and not n.endswith("-latest"))
         if listing_ok:
             chain = valid + extra[:3]
         else:
             chain = list(GEMINI_MODELS) + extra[:2]   # listing looks partial - keep ours
         if not chain:
             chain = list(GEMINI_MODELS)
-        if "gemini-flash-latest" not in chain:
-            chain.append("gemini-flash-latest")  # safety-net alias
+        # 'gemini-flash-latest' is never used: it is a moving 'latest' alias that Google points
+        # at its most congested endpoint. It is not appended here, and it is also filtered out
+        # of the live 'extra' models above - the chain already has real Flash/Gemma safety nets.
         if bad:
             log.warning("Dropping unavailable models: %s", ", ".join(bad))
         GEMINI_MODELS = chain
@@ -4244,10 +4256,16 @@ def main() -> None:
         try:
             log.info("memory file: %s", MEM.MEMORY_FILE)
             if os.environ.get("RENDER") or "render" in os.environ.get("RENDER_SERVICE_ID", ""):
-                if not os.environ.get("MEMORY_FILE"):
-                    log.warning("Running on Render WITHOUT MEMORY_FILE set: the disk is wiped on "
-                                "every redeploy, so all long-term memory will be lost. Mount a "
-                                "Render Disk and set MEMORY_FILE to a path on it.")
+                log.warning(
+                    "Running on Render: a FREE web service has an ephemeral filesystem, so "
+                    "memory is lost on every redeploy AND every spin-down (free services sleep "
+                    "after 15 min idle). A persistent disk CANNOT be attached on the free plan. "
+                    "Keep the service awake (UptimeRobot -> /health every 5 min) so it never "
+                    "sleeps; that preserves memory between deploys.")
+                if os.environ.get("MEMORY_FILE"):
+                    log.warning("MEMORY_FILE is set (%s) - it only survives if it points at a "
+                                "persistent disk, which needs a PAID Render service.",
+                                os.environ.get("MEMORY_FILE"))
         except Exception as e:  # noqa: BLE001
             log.debug("memory path check failed: %s", e)
 
