@@ -2452,17 +2452,32 @@ def start_health_server() -> None:
     if port <= 0:
         return
 
+    # The health reply must stay TINY. cron-job.org aborts a check with "output too large"
+    # when the response body grows, which silently killed the keep-alive - and a spun-down
+    # free instance is exactly the 50-second delay on the first message. So: plain text,
+    # 2 bytes, on every path, with an explicit Content-Length.
+    _OK = b"ok"
+
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
+        protocol_version = "HTTP/1.0"
+
+        def _send(self, body: bool):
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(_OK)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
+            if body:
+                self.wfile.write(_OK)
+
+        def do_GET(self):
+            self._send(True)
 
         def do_HEAD(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
+            self._send(False)
+
+        def do_POST(self):
+            self._send(True)
 
         def log_message(self, *args):
             pass
@@ -3347,11 +3362,20 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 return
             clean = clean_reply(ans)
             if not clean:
-                # The reply was nothing but internal tags (e.g. only "[react:😳]"). Falling
-                # back to the RAW text leaked the tag into the chat as visible text, so strip
-                # the tags properly and, if truly nothing is left, send a neutral line.
+                # Two very different cases, and they must NOT look the same to the user:
+                #  1) the reply was nothing but internal tags (e.g. only "[react:😳]") -> a
+                #     bare tick is fine, the reaction itself was the answer.
+                #  2) the model returned NOTHING AT ALL (empty / truncated) -> a bare "✅" looked
+                #     like the bot ignoring them, so say something real instead.
                 leftover = _ANY_TAG_RE.sub("", strip_tag_partial(ans or "")).strip()
-                clean = leftover if leftover else "✅"
+                if leftover:
+                    clean = leftover
+                elif not (ans or "").strip():
+                    log.warning("model returned an EMPTY answer for chat %s", chat_id)
+                    clean = ("Kuch technical issue aa gaya aur jawab khaali aa gaya. "
+                             "Ek baar dobara bhejo.")
+                else:
+                    clean = "✅"
             log_line(chat_id, "VIDEX", clean)
 
             for url in find_image_urls(clean)[:2]:
