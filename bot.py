@@ -244,6 +244,23 @@ STREAM_TOTAL_TIMEOUT = float(os.environ.get("STREAM_TOTAL_TIMEOUT", "45") or "45
 # NOTE: thinking tokens count towards this cap, so too small a value can make a reply come
 # back EMPTY (which then walks the whole chain and ends in 'busy'). 2048 leaves headroom.
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "2048") or "2048")
+# ---- Real-time research (keyless - no search API of any kind) ----
+# The model asks for a lookup with [search: ...]; we fetch it from public keyless sources and
+# let it answer again with the facts in hand. Bounded, because each round costs one more
+# model call and the model-walk budget is small.
+#   RESEARCH_MAX_ROUNDS = how many lookups ONE reply may trigger (minimum useful = 1)
+#   RESEARCH_RESULTS    = how many result lines to hand back per lookup
+RESEARCH_ENABLED = os.environ.get("RESEARCH_ENABLED", "true").strip().lower() not in (
+    "0", "false", "no", "off")
+RESEARCH_MAX_ROUNDS = max(1, min(4, int(os.environ.get("RESEARCH_MAX_ROUNDS", "3") or "3")))
+RESEARCH_RESULTS = max(1, min(10, int(os.environ.get("RESEARCH_RESULTS", "6") or "6")))
+# Deep mode opens the top result pages and feeds their real text back - that is what turns
+# "roughly around X" into an actual figure.
+RESEARCH_DEEP = os.environ.get("RESEARCH_DEEP", "true").strip().lower() not in (
+    "0", "false", "no", "off")
+RESEARCH_PAGES = max(0, min(3, int(os.environ.get("RESEARCH_PAGES", "2") or "2")))
+RESEARCH_PAGE_CHARS = max(300, min(4000, int(os.environ.get("RESEARCH_PAGE_CHARS", "1500") or "1500")))
+
 # Total seconds allowed for ONE walk over the Gemini model chain (0 = uncapped). Each model
 # is tried with and without thinking, so without this the walk could run for minutes.
 GEMINI_BUDGET = float(os.environ.get("GEMINI_BUDGET", "18") or "18")
@@ -634,11 +651,18 @@ SYSTEM_PROMPT = (
     "You have four tools. They run SILENTLY: the person is never told, so NEVER mention a "
     "tool, never say you 'searched' or 'made a file', and never print these tags as text - "
     "they are instructions, not content.\n"
-    "1. [search: <query>] - look something up on the live web. Use it ONLY when the answer "
-    "depends on CURRENT facts: news, prices, scores, releases, dates, 'latest'/'aaj'/'abhi', "
-    "or who currently holds a post. Do NOT use it for general knowledge, opinions, coding "
-    "help, maths, or anything you already know well - it costs time. At most ONE per reply; "
-    "the system fetches it and asks you again with the facts, so just emit the tag and stop.\n"
+    "1. [search: <query>] - look something up on the live web. YOU MUST USE IT whenever the "
+    "answer could have changed since your training, and you must do it BEFORE answering, not "
+    "from memory. That means: prices, rates, exchange rates, share/crypto prices, gold/silver "
+    "rates, scores, results, standings, weather, news, 'latest'/'current'/'today'/'aaj'/'abhi'/'kal', "
+    "anything with a date, releases and version numbers, availability, opening hours, or who "
+    "currently holds a post. If you are not certain a fact is still true today, search - a "
+    "confident wrong number is far worse than one extra second.\n"
+    "   Emit the tag ALONE on its own line and stop there; the system fetches it and asks you "
+    "again with the real facts, and only then do you answer. You may do this up to "
+    f"{RESEARCH_MAX_ROUNDS} times in one reply if you need to refine the query.\n"
+    "   Do NOT search for: general knowledge, definitions, opinions, advice, coding help, "
+    "maths, translations, or things you already know well.\n"
     "2. [file: name.md] on its own line, then the content, then [/file] on its own line - "
     "writes the content out as a real downloadable file. Use it only when you produced "
     "something long or structured they will want to KEEP or reuse: notes, a plan, a "
@@ -1638,6 +1662,8 @@ async def build_context(u: Update, bot, lang: str, media_state: str = "none",
         "=== LIVE CONTEXT (answer from this; never contradict it) ===",
         f"Current date and time: {now.strftime('%d %b %Y, %I:%M %p')} {now.tzname()}.",
         f"The person speaking now: {user.full_name} (Telegram ID {user.id}).",
+        ("They sent an ALBUM of several photos at once - look at ALL of them, and compare "
+         "them if they are related." if media_state == "images_loaded" else ""),
         f"Language of this message: {LANG_LABEL.get(lang, 'English')}. "
         f"Reply in exactly this language and script.",
         (f"Voice note for THIS reply: {'WILL BE SENT - you ARE answering by voice' if voice_reply else 'not being sent'}. "
@@ -1793,18 +1819,22 @@ _VOICE_TAG_RE = re.compile(r"\[\s*(?:voice|voicereply|voice reply)\s*\]", re.I)
 _AUTO_IMAGE_RE = re.compile(r"\[\s*image\s*:\s*([^\]]{3,300})\]", re.I)
 _SEARCH_TAG_RE = re.compile(r"\[\s*search\s*:\s*([^\]\n]{3,200})\]", re.I)
 
-ACTION_COOLDOWN = float(os.environ.get("ACTION_COOLDOWN", "90") or "90")     # seconds/chat/kind
-ACTION_DAILY_CAP = int(os.environ.get("ACTION_DAILY_CAP", "12") or "12")     # per chat, per kind
-# ---- Real-time research (keyless - no search API of any kind) ----
-# The model asks for a lookup with [search: ...]; we fetch it from public keyless sources and
-# let it answer again with the facts in hand. Bounded, because each round costs one more
-# model call and the model-walk budget is small.
-#   RESEARCH_MAX_ROUNDS = how many lookups ONE reply may trigger (minimum useful = 1)
-#   RESEARCH_RESULTS    = how many result lines to hand back per lookup
-RESEARCH_ENABLED = os.environ.get("RESEARCH_ENABLED", "true").strip().lower() not in (
-    "0", "false", "no", "off")
-RESEARCH_MAX_ROUNDS = max(1, min(4, int(os.environ.get("RESEARCH_MAX_ROUNDS", "2") or "2")))
-RESEARCH_RESULTS = max(1, min(8, int(os.environ.get("RESEARCH_RESULTS", "5") or "5")))
+# Per-kind budgets. One global number was too blunt: a file costs nothing (local bytes) while
+# an image hits Pollinations' ~45s-per-IP gate, so the tight limit belongs on images only.
+# These are PER CHAT, so the total scales with however many users you have - 100 users do not
+# share one bucket.
+ACTION_LIMITS = {
+    "file":   (float(os.environ.get("FILE_COOLDOWN", "20") or "20"),
+               int(os.environ.get("FILE_DAILY_CAP", "40") or "40")),
+    "voice":  (float(os.environ.get("VOICE_COOLDOWN", "45") or "45"),
+               int(os.environ.get("VOICE_DAILY_CAP", "40") or "40")),
+    "image":  (float(os.environ.get("IMAGE_COOLDOWN_ACTION", "60") or "60"),
+               int(os.environ.get("IMAGE_DAILY_CAP", "15") or "15")),
+    "search": (float(os.environ.get("SEARCH_COOLDOWN", "10") or "10"),
+               int(os.environ.get("SEARCH_DAILY_CAP", "60") or "60")),
+}
+ACTION_COOLDOWN = float(os.environ.get("ACTION_COOLDOWN", "30") or "30")     # fallback, seconds
+ACTION_DAILY_CAP = int(os.environ.get("ACTION_DAILY_CAP", "40") or "40")     # fallback, per day
 _ACTION_LAST: dict = {}       # (chat_id, kind) -> epoch of the last allowed action
 _ACTION_DAY: dict = {}        # (chat_id, kind) -> (day_key, count)
 
@@ -1814,15 +1844,20 @@ MAX_FILE_BYTES = 400 * 1024
 
 
 def action_allowed(chat_id: int, kind: str) -> bool:
-    """Rate-limit an autonomous action so the bot can never hammer a free quota."""
+    """Rate-limit an autonomous action so the bot can never hammer a free quota.
+
+    Budgets are PER CHAT and per kind (see ACTION_LIMITS), so a busy bot with many users
+    still gives each chat its own allowance instead of one shared bucket.
+    """
+    cool, cap = ACTION_LIMITS.get(kind, (ACTION_COOLDOWN, ACTION_DAILY_CAP))
     now = time.time()
-    if now - _ACTION_LAST.get((chat_id, kind), 0.0) < ACTION_COOLDOWN:
+    if now - _ACTION_LAST.get((chat_id, kind), 0.0) < cool:
         return False
     day = now_local().strftime("%Y-%m-%d")
     d, n = _ACTION_DAY.get((chat_id, kind), (day, 0))
     if d != day:
         d, n = day, 0
-    if ACTION_DAILY_CAP and n >= ACTION_DAILY_CAP:
+    if cap and n >= cap:
         return False
     _ACTION_DAY[(chat_id, kind)] = (d, n + 1)
     _ACTION_LAST[(chat_id, kind)] = now
@@ -1860,8 +1895,15 @@ async def send_made_file(bot, chat_id: int, name: str, content: str) -> bool:
 
 # ============================ PART 13: AI CALL ============================
 def _user_parts(prompt_text: str, image=None, audio=None, doc=None):
+    """Build the content parts. `image` may be ONE (bytes, mime) tuple or a LIST of them -
+    a Telegram album is several photos, and all of them must reach the model."""
     parts = [types.Part.from_text(text=prompt_text)]
-    for blob in (image, audio, doc):
+    blobs = []
+    if isinstance(image, (list, tuple)) and image and isinstance(image[0], (list, tuple)):
+        blobs += list(image)            # a list of (bytes, mime) - an album
+    elif image:
+        blobs.append(image)             # a single (bytes, mime)
+    for blob in blobs + [audio, doc]:
         if blob:
             parts.append(types.Part.from_bytes(data=blob[0], mime_type=blob[1]))
     return parts
@@ -2449,7 +2491,8 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/voicefind <word> - search 2000+ voices\n"
         "/myphoto - describe my profile picture\n/logo - describe your logo\n"
         "/id - your Telegram ID\n/clear - clear chat memory\n"
-        "/forget - delete everything I stored about you\n\n"
+        "/forget - delete everything I stored about you\n"
+        "/research <query> - look something up on the live web\n\n"
         "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
 # Command menus. Telegram's BotFather /setcommands can only publish ONE list for everyone,
 # but the API can also scope a list to a specific chat - so the owner gets the extra
@@ -2485,6 +2528,8 @@ OWNER_COMMANDS = [
     ("voicelist", "Your custom voices"),
     ("voicefind", "Search 2000+ voices"),
 ]
+# "research" is public - anyone may force a live lookup.
+PUBLIC_COMMANDS.append(("research", "Look something up on the live web"))
 
 AI_HELP = ("🤖 *How to use the AI*\n\nJust type anything and send, for example:\n"
            "• _What is today's date?_\n• _How many members are in this group?_\n"
@@ -2781,6 +2826,35 @@ async def cmd_forget(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         ". This chat's short-term context is cleared too.")
 
 
+async def cmd_research(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force a live lookup - a guaranteed path when you want current facts and do not want to
+    rely on the model choosing to search by itself."""
+    q = " ".join(c.args) if c.args else ""
+    if not q.strip():
+        await u.message.reply_text(
+            "Usage: `/research <what to look up>`\n"
+            "Example: `/research gold rate today in India`", parse_mode="Markdown")
+        return
+    chat_id = u.effective_chat.id
+    await u.message.reply_text(f"🔎 Looking up: {q[:150]}")
+    results = await free_web_search(q, RESEARCH_RESULTS)
+    if not results:
+        await u.message.reply_text(
+            "Could not reach the live sources just now. Try again in a moment, or ask "
+            "normally and I will answer from what I know.")
+        return
+    ask = (f"The user asked: {q}\n\nAnswer using ONLY the live results below. If they do not "
+           "answer it, say so plainly instead of guessing. Give the actual figures/dates you "
+           "find, keep it short, and match the user's language.")
+    ans = await ask_gemini(chat_id, ask,
+                           "=== LIVE WEB RESULTS (fetched just now) ===\n" + results)
+    if not ans or ans == BUSY_MSG:
+        await _send_plain(c.bot, chat_id, results[:3500])
+        return
+    for chunk in split_text(clean_reply(ans)):
+        await _safe_send(u, c, md_to_html(chunk), chunk)
+
+
 async def cmd_ai(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     text = " ".join(c.args) if c.args else ""
     if not text:
@@ -2825,6 +2899,17 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     text = (msg.text or msg.caption or "").strip()
     media = media_from_message(msg)
     if not text and not media:
+        return
+    # An ALBUM arrives as several separate messages that share a media_group_id. Handled
+    # one-by-one the bot saw only the first photo and answered the album three times. So
+    # buffer them for a moment and answer ONCE with every image attached.
+    mgid = getattr(msg, "media_group_id", None)
+    if mgid and media and media.get("kind") == "image":
+        buf = _MEDIA_GROUPS.setdefault(mgid, {"u": u, "c": c, "items": [], "task": None})
+        buf["items"].append((text, media))
+        if buf["task"]:
+            buf["task"].cancel()
+        buf["task"] = asyncio.create_task(_flush_media_group(mgid))
         return
     remember_member(u.effective_chat.id, u.effective_user)
     if MEM is not None:
@@ -2931,10 +3016,48 @@ async def fetch_profile_photo(bot, user_id):
         return None
 
 
+# Telegram album buffering (media_group_id -> pending messages).
+_MEDIA_GROUPS: dict = {}
+MEDIA_GROUP_WAIT = float(os.environ.get("MEDIA_GROUP_WAIT", "1.4") or "1.4")
+
+
+async def _flush_media_group(mgid: str) -> None:
+    """Wait for the rest of an album to arrive, then answer once with ALL the images."""
+    try:
+        await asyncio.sleep(MEDIA_GROUP_WAIT)
+        buf = _MEDIA_GROUPS.pop(mgid, None)
+        if not buf or not buf["items"]:
+            return
+        u, c, items = buf["u"], buf["c"], buf["items"]
+        caption = " ".join(t for t, _ in items if t).strip()
+        medias = [m for _, m in items if m]
+        log.info("media group %s: answering once with %s photos", mgid, len(medias))
+        await _answer(u, c, caption, medias)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log.warning("media group flush failed: %s", str(e)[:150])
+
+
 async def _prepare_media(c, media):
+    """Fetch whatever the user sent. `media` may be ONE media dict or a LIST of them, so an
+    album of photos becomes a list of image blobs the model can see together."""
     image = audio = doc = None
     state, transcript = "none", ""
     if not media:
+        return image, audio, doc, state, transcript
+    if isinstance(media, list):
+        # An album: load every image, and keep the first audio/doc if any came with it.
+        imgs = []
+        for one in media:
+            if one.get("kind") == "image":
+                data = await fetch_bytes(c, one["file_id"], MAX_IMAGE_BYTES)
+                if data:
+                    imgs.append((data, one.get("mime") or "image/jpeg"))
+        if imgs:
+            image, state = imgs, ("image_loaded" if len(imgs) == 1 else "images_loaded")
+        else:
+            state = "image_failed"
         return image, audio, doc, state, transcript
     kind = media["kind"]
     if kind == "image":
@@ -2990,6 +3113,11 @@ def _short_summary(media, state, text, forward):
     bits = []
     if forward:
         bits.append(f"[{forward}]")
+    if isinstance(media, list):
+        n_img = sum(1 for m in media if m.get("kind") == "image")
+        if n_img:
+            bits.append(f"[{n_img} photos]")
+        media = next((m for m in media if m.get("kind") != "image"), None)
     if media:
         k = media["kind"]
         if k == "image":
@@ -3083,7 +3211,9 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             if transcript and not text:
                 text = transcript
             if not text and media:
-                text = "Please look at this and tell me about it."
+                text = ("Please look at these photos and tell me about them."
+                        if media_state == "images_loaded"
+                        else "Please look at this and tell me about it.")
 
             # Remember what this person sent BEFORE asking, so the log shows it.
             log_line(chat_id, speaker, _short_summary(media, media_state, text, forward))
@@ -3354,33 +3484,60 @@ _PROACTIVE_PENDING: set = set()
 _FREE_SEARCH_URL = "https://html.duckduckgo.com/html/"
 
 
+# Two different user agents on purpose - the two sites want opposite things:
+#   * DuckDuckGo serves its lite page to a normal BROWSER agent (a bot-looking agent is
+#     rejected), and its full html/ endpoint now answers HTTP 202 with zero results.
+#   * Wikimedia's robot policy REJECTS a browser agent (403 "Please respect our robot
+#     policy") and requires a DESCRIPTIVE agent with contact info.
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
+_UA_BOT = "VIDEXBot/1.0 (Telegram assistant; +https://t.me/Linnet_Agents_Bot)"
 
 
 def _strip_html(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s or "")).strip()
 
 
-async def _ddg_html(query: str, n: int) -> list:
-    """DuckDuckGo's plain HTML endpoint. Keyless, no API, but blocks datacenter IPs sometimes."""
-    r = await HTTP.post(_FREE_SEARCH_URL, data={"q": query}, headers={"User-Agent": _UA})
+async def _ddg_lite(query: str, n: int) -> list:
+    """DuckDuckGo's 'lite' endpoint - the one that actually still answers.
+
+    It is a plain HTML table. NOTE the attributes use SINGLE quotes (class='result-link'),
+    which is why a double-quote regex silently matched nothing.
+    """
+    r = await HTTP.post("https://lite.duckduckgo.com/lite/", data={"q": query},
+                        headers={"User-Agent": _UA})
+    if r.status_code != 200:
+        return []
+    html = r.text or ""
+    links = re.findall(r"class=['\"]result-link['\"][^>]*>(.*?)</a>", html, re.S | re.I)
+    snips = re.findall(r"class=['\"]result-snippet['\"][^>]*>(.*?)</td>", html, re.S | re.I)
+    out = []
+    for i, title in enumerate(links[:n]):
+        t = _strip_html(title)
+        s = _strip_html(snips[i]) if i < len(snips) else ""
+        if t:
+            out.append(f"- {t}: {s[:260]}")
+    return out
+
+
+async def _wikipedia(query: str, n: int = 3) -> list:
+    """Wikipedia's public API - keyless and reliable, but needs the descriptive UA above."""
+    r = await HTTP.get("https://en.wikipedia.org/w/api.php",
+                       params={"action": "query", "list": "search", "srsearch": query,
+                               "format": "json", "srlimit": n},
+                       headers={"User-Agent": _UA_BOT})
     if r.status_code != 200:
         return []
     out = []
-    for m in re.finditer(r'result__a"[^>]*>(.*?)</a>.*?result__snippet"[^>]*>(.*?)</a>',
-                         r.text or "", re.S | re.I):
-        title = _strip_html(m.group(1))
-        snip = _strip_html(m.group(2))
+    for hit in ((r.json().get("query") or {}).get("search") or [])[:n]:
+        title = hit.get("title", "")
+        snip = _strip_html(hit.get("snippet", ""))
         if title:
-            out.append(f"- {title}: {snip[:220]}")
-        if len(out) >= n:
-            break
+            out.append(f"- Wikipedia, {title}: {snip[:240]}")
     return out
 
 
 async def _ddg_instant(query: str) -> list:
-    """DuckDuckGo Instant Answer JSON API - keyless, and gives a clean abstract for
-    'what/who is X' style questions."""
+    """DuckDuckGo Instant Answer JSON - keyless; great for 'who/what is X', empty otherwise."""
     r = await HTTP.get("https://api.duckduckgo.com/",
                        params={"q": query, "format": "json", "no_html": "1",
                                "skip_disambig": "1"},
@@ -3398,44 +3555,87 @@ async def _ddg_instant(query: str) -> list:
     return out
 
 
-async def _wikipedia(query: str, n: int = 2) -> list:
-    """Wikipedia's public API - keyless, reliable, and never blocks a datacenter IP."""
-    r = await HTTP.get("https://en.wikipedia.org/w/api.php",
-                       params={"action": "query", "list": "search", "srsearch": query,
-                               "format": "json", "srlimit": n},
-                       headers={"User-Agent": _UA})
-    if r.status_code != 200:
-        return []
-    out = []
-    for hit in ((r.json().get("query") or {}).get("search") or [])[:n]:
-        title = hit.get("title", "")
-        snip = _strip_html(hit.get("snippet", ""))
-        if title:
-            out.append(f"- Wikipedia, {title}: {snip[:220]}")
-    return out
+async def _read_page(url: str, limit: int = 1200) -> str:
+    """Fetch a page and pull out its readable text - the 'deeper research' step.
+
+    No readability library, just: strip script/style, drop tags, collapse whitespace, keep
+    the meatiest chunk. Best-effort - any failure returns ''.
+    """
+    if not url or not url.startswith("http"):
+        return ""
+    try:
+        r = await HTTP.get(url, headers={"User-Agent": _UA}, timeout=12)
+        if r.status_code != 200 or "html" not in (r.headers.get("content-type") or ""):
+            return ""
+        h = re.sub(r"(?is)<(script|style|nav|header|footer|aside)[^>]*>.*?</\1>", " ", r.text or "")
+        h = re.sub(r"(?is)<br\s*/?>|</p>|</div>|</li>|</h[1-6]>", "\n", h)
+        txt = _strip_html(h)
+        txt = re.sub(r"\s{2,}", " ", txt)
+        # Keep the densest window: pages start with menus and boilerplate.
+        if len(txt) > limit:
+            start = max(0, len(txt) // 6)
+            txt = txt[start:start + limit]
+        return txt.strip()[:limit]
+    except Exception as e:  # noqa: BLE001
+        log.debug("page read failed (%s): %s", url[:60], str(e)[:80])
+        return ""
 
 
-async def free_web_search(query: str, n: int = 5) -> str:
-    """Real-time lookup with NO API key, by combining three keyless public sources.
+# DuckDuckGo rate-limits rapid repeats (a burst of lookups starts returning HTTP 202 with
+# zero results), so identical queries are cached for a while. This also makes a repeat
+# question instant instead of a network round trip.
+_SEARCH_CACHE: dict = {}
+SEARCH_CACHE_TTL = float(os.environ.get("SEARCH_CACHE_TTL", "600") or "600")
+
+
+async def free_web_search(query: str, n: int = 5, deep: bool = True) -> str:
+    """Real-time lookup with NO API key, by combining keyless public sources.
 
     The Gemini free tier has NO search grounding, so this is the only way to get anything
-    current. Sources are tried in order and the first that returns anything useful wins; a
-    failure in any of them is silent because each is best-effort.
+    current. Sources are tried in order and the first that returns something useful wins.
+    With deep=True we then open the top result and include its actual page text, which is
+    what makes answers about prices/scores/statistics accurate rather than guessed.
     """
     if not query:
         return ""
-    for fn in (_ddg_html, _ddg_instant, _wikipedia):
+    ckey = (query.strip().lower()[:120], n, deep)
+    hit = _SEARCH_CACHE.get(ckey)
+    if hit and (time.time() - hit[0]) < SEARCH_CACHE_TTL:
+        log.info("research cache hit for %r", query[:50])
+        return hit[1]
+    lines = []
+    for fn in (_ddg_lite, _wikipedia, _ddg_instant):
         try:
-            if fn is _ddg_html:
-                res = await fn(query, n)
-            else:
-                res = await fn(query)
+            res = await (fn(query, n) if fn is not _ddg_lite else fn(query, n))
             if res:
                 log.info("research via %s -> %s results", fn.__name__, len(res))
-                return "\n".join(res[:n])
+                lines = res[:n]
+                break
         except Exception as e:  # noqa: BLE001
             log.debug("research source %s failed: %s", fn.__name__, str(e)[:100])
-    return ""
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    if deep and RESEARCH_DEEP:
+        try:
+            r2 = await HTTP.post("https://lite.duckduckgo.com/lite/", data={"q": query},
+                                 headers={"User-Agent": _UA})
+            urls = re.findall(r"href=['\"](https?://[^'\"]+)['\"]", r2.text or "")
+            urls = [u for u in urls if "duckduckgo.com" not in u][:RESEARCH_PAGES]
+            for u in urls:
+                txt = await _read_page(u, RESEARCH_PAGE_CHARS)
+                if txt and len(txt) > 200:
+                    body += f"\n- Page {u[:70]}: {txt[:RESEARCH_PAGE_CHARS]}"
+                    log.info("research: read page %s (%s chars)", u[:50], len(txt))
+        except Exception as e:  # noqa: BLE001
+            log.debug("deep research failed: %s", str(e)[:100])
+    if body:
+        _SEARCH_CACHE[ckey] = (time.time(), body)
+        if len(_SEARCH_CACHE) > 200:                  # keep the cache small
+            oldest = sorted(_SEARCH_CACHE.items(), key=lambda kv: kv[1][0])[:50]
+            for k, _ in oldest:
+                _SEARCH_CACHE.pop(k, None)
+    return body
 
 
 def _in_quiet_hours(now) -> bool:
@@ -3890,6 +4090,7 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("ai", cmd_ai))
+    app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("welcome", cmd_welcome))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("image", cmd_image))
