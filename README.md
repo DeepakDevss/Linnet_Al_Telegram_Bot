@@ -23,7 +23,7 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Reads photos, documents, voice notes, and audio
 - Understands plain requests with no command — say "make me a report" and it attaches the file, or "draw a logo" and it makes the image
 - Sets reminders and delivers them on time ("remind me in 2h to call mom"), with no external service
-- Reads a link you paste and answers about the page
+- Reads a link you paste and answers about the page — including YouTube links (title, channel, description and public captions), with no browser and no key
 - Looks things up live (prices, weather, news) with no API key
 - Does exact arithmetic on request
 - Sends voice replies using text-to-speech

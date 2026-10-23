@@ -68,6 +68,7 @@ import urllib.parse
 import unicodedata
 import time
 import json
+import html
 import wave
 import random
 import shutil
@@ -700,6 +701,8 @@ SYSTEM_PROMPT = (
     "3. [voice] - send this reply as a voice note instead of text. Use it sparingly, only "
     "when hearing it beats reading it (a short warm line, a story, a pronunciation, casual "
     "voice chat). Never on ordinary informational answers.\n"
+    "3b. If the person shares a YouTube link, the system has ALREADY read the video's title, "
+    "channel, description and public captions for you - use them to answer.\n"
     "4. [image: <description>] - create an image. Use it ONLY when they clearly want to SEE "
     "something (they ask for a picture, drawing, design, logo or art, or a visual genuinely "
     "explains it). NEVER for normal questions.\n"
@@ -2844,7 +2847,8 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/reminders - list your reminders\n/delremind <id> - delete one\n"
         "/privacy - how your data is handled\n"
         "/research <query> - look something up on the live web\n\n"
-        "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
+        "💡 Send text, a photo, a voice note, a PDF or a YouTube link - the AI replies in "
+        "your language.")
 # Command menus. Telegram's BotFather /setcommands can only publish ONE list for everyone,
 # but the API can also scope a list to a specific chat - so the owner gets the extra
 # owner-only commands in their own private chat. These two lists are the single source of
@@ -4212,6 +4216,91 @@ _SKIP_URL_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico
                  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv")
 
 
+# ---- YouTube links --------------------------------------------------------------------
+# When someone pastes a YouTube link the bot should know what the video IS, not just fetch a
+# JS-heavy page. This uses ONLY public, keyless endpoints: YouTube's own oEmbed API plus the
+# public watch page's metadata and its public caption track. No headless browser, no stealth
+# patches, no bot-detection evasion - just ordinary HTTP GETs of public URLs, the same as
+# reading any other shared link.
+_YT_URL_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?[^\s]*?v=|shorts/|embed/|live/)|youtu\.be/)([A-Za-z0-9_-]{6,})",
+    re.I)
+
+
+def _yt_video_id(url: str):
+    m = _YT_URL_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def _yt_unescape(s: str) -> str:
+    return (html.unescape(s or "").replace("\\n", "\n").replace("\\/", "/")
+            .replace('\\"', '"').replace("\\u0026", "&").strip())
+
+
+async def _youtube_context(url: str) -> str:
+    """What a YouTube video is about - the legitimate, keyless way."""
+    vid = _yt_video_id(url)
+    if not vid:
+        return ""
+    canon = "https://www.youtube.com/watch?v=" + vid
+    title = author = desc = transcript = ""
+    # 1. YouTube's own public oEmbed endpoint (documented, no key).
+    try:
+        r = await HTTP.get("https://www.youtube.com/oembed",
+                           params={"url": canon, "format": "json"},
+                           headers=_YH_HEADERS, timeout=8)
+        if r.status_code == 200:
+            j = r.json() or {}
+            title = j.get("title") or ""
+            author = j.get("author_name") or ""
+    except Exception as e:  # noqa: BLE001
+        log.debug("yt oembed failed: %s", str(e)[:80])
+    # 2. The public watch page carries the description and (often) the caption track.
+    page = ""
+    try:
+        r = await HTTP.get(canon, headers={**_YH_HEADERS, "User-Agent": _UA,
+                                           "Accept-Language": "en-US,en;q=0.9",
+                                           "Cookie": "CONSENT=YES+1"}, timeout=10)
+        if r.status_code == 200:
+            page = r.text or ""
+    except Exception as e:  # noqa: BLE001
+        log.debug("yt page failed: %s", str(e)[:80])
+    if page:
+        m = re.search(r'"shortDescription":"(.*?)","', page, re.S)
+        if m:
+            desc = _yt_unescape(m.group(1))
+        if not title:
+            m = re.search(r'"title":"(.*?)"', page, re.S)
+            if m:
+                title = _yt_unescape(m.group(1))
+        # 3. The public caption track (best effort - some hosts cannot reach it).
+        m = re.search(r'"captionTracks":(\[.*?\])', page, re.S)
+        if m:
+            try:
+                tracks = json.loads(m.group(1)) or []
+            except Exception:  # noqa: BLE001
+                tracks = []
+            base = _yt_unescape((tracks[0] or {}).get("baseUrl") or "") if tracks else ""
+            if base:
+                try:
+                    r = await HTTP.get(base, headers=_YH_HEADERS, timeout=10)
+                    if r.status_code == 200:
+                        txt = html.unescape(re.sub(r"<[^>]+>", " ", r.text or ""))
+                        transcript = re.sub(r"\s+", " ", txt).strip()[:3000]
+                except Exception as e:  # noqa: BLE001
+                    log.debug("yt captions failed: %s", str(e)[:80])
+    if not (title or desc or transcript):
+        return ""
+    out = ["YouTube video: " + (title or vid)]
+    if author:
+        out.append("channel: " + author)
+    if desc:
+        out.append("description: " + re.sub(r"\s+", " ", desc)[:1200])
+    if transcript:
+        out.append("transcript (public captions, may be partial): " + transcript)
+    return "\n".join(out)
+
+
 async def _read_links(text: str, limit: int = 2) -> str:
     """Fetch the pages behind links the user shared, so the model can actually read them."""
     urls = []
@@ -4226,6 +4315,11 @@ async def _read_links(text: str, limit: int = 2) -> str:
             urls.append(u)
     out = []
     for u in urls[:limit]:
+        if _yt_video_id(u):
+            yt = await _youtube_context(u)
+            if yt:
+                out.append(f"- {u}\n{yt}")
+                continue
         txt = await _read_page(u, 2000)
         if txt:
             out.append(f"- {u}\n{txt[:1600]}")
