@@ -12,6 +12,7 @@ LAYERS
        - Photos / image documents -> passed to the AI (vision)
        - Voice notes / audio       -> transcribed (Groq Whisper) or sent to the AI
        - Documents (PDF / txt / docx / xlsx / pptx) -> read and answered
+       - Links (http / https)      -> the page is fetched and read for the AI
        - Forwarded messages        -> the original source is described to the AI
   5. VOICE REPLIES (TTS) — Gemini free-tier TTS, styled to sound natural & human
   6. AI-CHOSEN emoji reactions (before the text reply), then the tag is stripped
@@ -57,7 +58,9 @@ Env vars (best practice: leave the *_MODELS ones UNSET and let the built-in chai
 # ============================ PART 1: IMPORTS ============================
 import os
 import io
+import ast
 import base64
+import operator
 import re
 import urllib.parse
 import unicodedata
@@ -524,6 +527,8 @@ SYSTEM_PROMPT = (
     "- HEAR VOICE / AUDIO: a voice note is HEARD, not seen - never say you can 'see' a voice note. "
     "Its transcript is given in the context; treat that as what the user said.\n"
     "- READ DOCUMENTS: a PDF or text file the user sends is attached; read it and answer.\n"
+    "- READ LINKS: if the user shares a link (http/https), its page text is attached to you - "
+    "read it and answer about it. Never say you cannot open links.\n"
     "- Know and use the LIVE CONTEXT (date/time, speaker, group, member count, owner, admins, "
     "members you have seen).\n"
     "- Send short text replies, react with one emoji, and (when voice mode is on) reply by voice.\n"
@@ -656,7 +661,7 @@ SYSTEM_PROMPT = (
     "  (Sent as the ONLY content. The bot then sends nothing at all.)"
     "\n"
     "=== LAYER 8c — YOUR OWN TOOLS (silent; use only when they genuinely help) ===\n"
-    "You have four tools. They run SILENTLY: the person is never told, so NEVER mention a "
+    "You have five tools. They run SILENTLY: the person is never told, so NEVER mention a "
     "tool, never say you 'searched' or 'made a file', and never print these tags as text - "
     "they are instructions, not content.\n"
     "1. [search: <query>] - look something up on the live web. YOU MUST USE IT whenever the "
@@ -683,6 +688,10 @@ SYSTEM_PROMPT = (
     "4. [image: <description>] - create an image. Use it ONLY when they clearly want to SEE "
     "something (they ask for a picture, drawing, design, logo or art, or a visual genuinely "
     "explains it). NEVER for normal questions.\n"
+    "5. [calc: <expression>] - evaluate arithmetic EXACTLY. Use it for ANY calculation - "
+    "percentages, totals, unit maths, big multiplications - instead of doing it in your head. "
+    "Emit the tag ALONE on its own line; the system computes it and asks you again with the "
+    "exact result. Allowed: numbers and + - * / // % ** and brackets.\n"
     "- At most ONE of these per reply, and MOST replies should use NONE. Ordinary "
     "conversation is the default; tools are the exception. They are rate-limited per chat, "
     "so if one is skipped the reply is simply sent without it - never promise an attachment "
@@ -806,7 +815,7 @@ log = logging.getLogger("linnet")
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 # Reused HTTP clients (connection pooling) instead of a new client per request.
-HTTP = httpx.AsyncClient(timeout=CALL_TIMEOUT)
+HTTP = httpx.AsyncClient(timeout=CALL_TIMEOUT, follow_redirects=True)
 HTTP_STT = httpx.AsyncClient(timeout=90)
 CONCURRENT_UPDATES = int(os.environ.get("CONCURRENT_UPDATES", "16") or "16")
 _RATE_LIMITER_ON = False   # set True when PTB's AIORateLimiter is active
@@ -901,7 +910,8 @@ _KNOWN_LOADED = False
 
 # A user must not be able to poison the transcript the model reads: no faking the
 # 'Name: what they said' format, and no injecting our internal tags.
-_TAG_INJECT_RE = re.compile(r"\[(?:react|quote|remember|image)\s*:[^\]]*\]", re.I)
+_TAG_INJECT_RE = re.compile(
+    r"\[(?:react|quote|remember|image|calc|search|file|voice)\b[^\]]*\]", re.I)
 _FAKE_NAME_RE = re.compile(r"^\s*[A-Za-z0-9_@.\- ]{1,32}:\s+")
 
 
@@ -1144,6 +1154,7 @@ def clean_reply(text: str) -> str:
     t = text or ""
     t = _FILE_BLOCK_RE.sub("", t)      # whole file blocks first (they span lines)
     t = _SEARCH_TAG_RE.sub("", t)
+    t = _CALC_RE.sub("", t)
     t = _VOICE_TAG_RE.sub("", t)
     t = _AUTO_IMAGE_RE.sub("", t)
     t = _QUOTE_TAG_RE.sub("", _REMEMBER_TAG_RE.sub(
@@ -1826,6 +1837,57 @@ _FILE_BLOCK_RE = re.compile(
 _VOICE_TAG_RE = re.compile(r"\[\s*(?:voice|voicereply|voice reply)\s*\]", re.I)
 _AUTO_IMAGE_RE = re.compile(r"\[\s*image\s*:\s*([^\]]{3,300})\]", re.I)
 _SEARCH_TAG_RE = re.compile(r"\[\s*search\s*:\s*([^\]\n]{3,200})\]", re.I)
+_CALC_RE = re.compile(r"\[\s*calc\s*:\s*([^\]\n]{1,200})\]", re.I)
+# Arithmetic only, evaluated by walking the AST - NEVER eval() on model or user text.
+_CALC_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+             ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+             ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+
+def safe_calc(expr: str):
+    """Evaluate a pure arithmetic expression safely. Returns a number, or None.
+
+    Uses the AST (never eval): only numbers, + - * / // %% ** and unary +/- are allowed, so
+    there is no way to reach a name, attribute, call or import.
+    """
+    expr = (expr or "").strip()
+    expr = (expr.replace("^", "**").replace("\u00d7", "*").replace("\u00f7", "/")
+            .replace("\u2013", "-").replace("\u2212", "-"))
+    expr = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", expr)     # 1,000 -> 1000
+    if not expr or len(expr) > 200:
+        return None
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return None
+
+    def walk(node):
+        if isinstance(node, ast.Expression):
+            return walk(node.body)
+        if (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool)):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            a, b = walk(node.left), walk(node.right)
+            if abs(b) > 1000 or abs(a) > 1e9:              # stop 9**9**9 style hangs
+                raise ValueError("exponent too large")
+            return a ** b
+        if isinstance(node, ast.BinOp) and type(node.op) in _CALC_OPS:
+            return _CALC_OPS[type(node.op)](walk(node.left), walk(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _CALC_OPS:
+            return _CALC_OPS[type(node.op)](walk(node.operand))
+        raise ValueError("disallowed")
+    try:
+        val = walk(tree)
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(val, bool) or isinstance(val, complex):
+        return None
+    if isinstance(val, float) and (val != val or val in (float("inf"), float("-inf"))):
+        return None
+    if abs(val) > 1e18:
+        return None
+    return val
 
 # A message that is plainly about something that CHANGES over time. Used only as a SAFETY
 # NET: the model is still the primary decider, but in practice it often answered
@@ -1857,6 +1919,8 @@ ACTION_LIMITS = {
                int(os.environ.get("IMAGE_DAILY_CAP", "15") or "15")),
     "search": (float(os.environ.get("SEARCH_COOLDOWN", "10") or "10"),
                int(os.environ.get("SEARCH_DAILY_CAP", "60") or "60")),
+    "link":   (float(os.environ.get("LINK_COOLDOWN", "15") or "15"),
+               int(os.environ.get("LINK_DAILY_CAP", "30") or "30")),
 }
 ACTION_COOLDOWN = float(os.environ.get("ACTION_COOLDOWN", "30") or "30")     # fallback, seconds
 ACTION_DAILY_CAP = int(os.environ.get("ACTION_DAILY_CAP", "40") or "40")     # fallback, per day
@@ -3267,6 +3331,18 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             prompt = recent_chat_block(chat_id, speaker)
             _t2 = time.monotonic()
 
+            # ---- SHARED LINKS ---------------------------------------------------
+            # If the user pasted a link, fetch its page text NOW so the model can read it.
+            if (RESEARCH_ENABLED and text and _URL_MSG_RE.search(text)
+                    and action_allowed(chat_id, "link")):
+                link_text = await _read_links(text, 2)
+                if link_text:
+                    ctx += ("\n\n=== LINK CONTENT (fetched just now from the user's message) "
+                            "===\n" + link_text +
+                            "\n\nThe user shared this link - read it and answer about it. Never "
+                            "say you cannot open links.")
+                    log.info("link read for chat %s -> %s chars", chat_id, len(link_text))
+
             # ---- PRE-FLIGHT RESEARCH -------------------------------------------
             # The model frequently answers a live-data question with "I cannot access the
             # internet" instead of asking to search. For messages that are plainly about
@@ -3340,7 +3416,31 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         image, audio, doc)
                     if ans2:
                         ans = ans2
-            ans = _SEARCH_TAG_RE.sub("", ans or "")      # never leak the tag to the user
+            # ---- CALCULATOR --------------------------------------------------------
+            # The model can ask for exact arithmetic with [calc: expr]. We evaluate it safely
+            # and let it answer again with the exact result. Bounded like the search loop.
+            for _c in range(RESEARCH_MAX_ROUNDS):
+                cm = _CALC_RE.search(ans or "")
+                if not cm:
+                    break
+                expr = cm.group(1)
+                ans = _CALC_RE.sub("", ans or "")
+                val = safe_calc(expr)
+                if val is None:
+                    log.info("calc rejected: %r", expr[:60])
+                    break
+                log.info("calc: %r = %s", expr[:60], val)
+                ans2 = await ask_gemini(
+                    chat_id, prompt,
+                    ctx + f"\n\n=== CALCULATOR (exact) ===\n{expr} = {val}\n"
+                          "Use this exact result in your answer; do not recompute it.",
+                    image, audio, doc)
+                if ans2:
+                    ans = ans2
+                else:
+                    break
+            ans = _SEARCH_TAG_RE.sub("", ans or "")      # never leak a tag to the user
+            ans = _CALC_RE.sub("", ans or "")
             _t3 = time.monotonic()
 
             # ---- AUTONOMOUS FILE / VOICE / IMAGE --------------------------------
@@ -3740,7 +3840,10 @@ async def _read_page(url: str, limit: int = 1200) -> str:
         log.debug("research: refusing a private-looking URL %s", host)
         return ""
     try:
-        r = await HTTP.get(url, headers={"User-Agent": _UA}, timeout=12)
+        # Wikimedia rejects a browser UA (403 "respect our robot policy") and needs the
+        # descriptive bot UA; almost every other site wants a normal browser UA.
+        ua = _UA_BOT if ("wikipedia.org" in host or "wikimedia.org" in host) else _UA
+        r = await HTTP.get(url, headers={"User-Agent": ua}, timeout=12)
         if r.status_code != 200 or "html" not in (r.headers.get("content-type") or ""):
             return ""
         h = re.sub(r"(?is)<(script|style|nav|header|footer|aside)[^>]*>.*?</\1>", " ", r.text or "")
@@ -3755,6 +3858,33 @@ async def _read_page(url: str, limit: int = 1200) -> str:
     except Exception as e:  # noqa: BLE001
         log.debug("page read failed (%s): %s", url[:60], str(e)[:80])
         return ""
+
+
+_URL_MSG_RE = re.compile(r"https?://[^\s<>\"')]+", re.I)
+# Link targets we cannot read as HTML - skip so a lookup is never wasted on them.
+_SKIP_URL_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico",
+                 ".mp4", ".mp3", ".ogg", ".wav", ".zip", ".rar", ".7z", ".apk", ".exe",
+                 ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv")
+
+
+async def _read_links(text: str, limit: int = 2) -> str:
+    """Fetch the pages behind links the user shared, so the model can actually read them."""
+    urls = []
+    for u in _URL_MSG_RE.findall(text or ""):
+        u = u.rstrip(".,;:!?)]}\"'")
+        low = u.lower()
+        if any(low.endswith(ext) for ext in _SKIP_URL_EXT):
+            continue
+        if "duckduckgo.com/l/" in low or "google.com/url" in low:
+            continue
+        if u not in urls:
+            urls.append(u)
+    out = []
+    for u in urls[:limit]:
+        txt = await _read_page(u, 2000)
+        if txt:
+            out.append(f"- {u}\n{txt[:1600]}")
+    return "\n".join(out)
 
 
 # DuckDuckGo rate-limits rapid repeats (a burst of lookups starts returning HTTP 202 with

@@ -21,6 +21,9 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Remembers users and chats between restarts
 - Tells apart who said what in group conversations
 - Reads photos, documents, voice notes, and audio
+- Reads a link you paste and answers about the page
+- Looks things up live (prices, weather, news) with no API key
+- Does exact arithmetic on request
 - Sends voice replies using text-to-speech
 - Picks a fitting emoji reaction for each message
 
