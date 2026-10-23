@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Linnet AI — long-term memory store (separate file).
+"""VIDEX AI — long-term memory store (separate file).
 
 Keeps a small, growing profile for every user and every chat the bot has seen:
 
@@ -26,7 +26,10 @@ import time
 _log = logging.getLogger("linnet")
 
 MEMORY_FILE = (os.environ.get("MEMORY_FILE") or
-               os.path.join(os.path.dirname(os.path.abspath(__file__)), "linnet_memory.json"))
+               os.path.join(os.path.dirname(os.path.abspath(__file__)), "videx_memory.json"))
+# Renaming the bot must NOT throw away memory that was already saved under the old name.
+_OLD_MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "linnet_memory.json")
 # 0 = UNLIMITED (no cap). Every new user / chat automatically gets its own entry.
 MAX_NOTES = int(os.environ.get("MEMORY_MAX_NOTES", "0") or "0")
 MAX_NOTE_LEN = int(os.environ.get("MEMORY_MAX_NOTE_LEN", "300") or "300")
@@ -55,12 +58,20 @@ def load() -> None:
     if _LOADED:
         return
     _LOADED = True
+    path = MEMORY_FILE
+    # One-time migration: if the new file is missing but the pre-rename one exists, read that
+    # instead so a rename never looks like "all memory vanished".
+    if not os.path.exists(path) and os.path.exists(_OLD_MEMORY_FILE):
+        path = _OLD_MEMORY_FILE
+        _log.info("using the pre-rename memory file: %s", path)
     try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if isinstance(raw, dict):
             _DATA["users"] = raw.get("users", {}) or {}
             _DATA["chats"] = raw.get("chats", {}) or {}
+        if path == _OLD_MEMORY_FILE:
+            save(force=True)          # write it out under the new name right away
     except FileNotFoundError:
         pass
     except json.JSONDecodeError as e:
