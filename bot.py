@@ -1819,6 +1819,23 @@ _VOICE_TAG_RE = re.compile(r"\[\s*(?:voice|voicereply|voice reply)\s*\]", re.I)
 _AUTO_IMAGE_RE = re.compile(r"\[\s*image\s*:\s*([^\]]{3,300})\]", re.I)
 _SEARCH_TAG_RE = re.compile(r"\[\s*search\s*:\s*([^\]\n]{3,200})\]", re.I)
 
+# A message that is plainly about something that CHANGES over time. Used only as a SAFETY
+# NET: the model is still the primary decider, but in practice it often answered
+# "I cannot access the internet" instead of asking to search, so we look these up up front.
+_LIVE_HINT_RE = re.compile(
+    r"\b(aaj|aaj\s*ka|today|abhi|currently|current|latest|recent|right\s*now|"
+    r"rate|price|bhav|bhaav|kitne\s*(me|mein|par)|kitna\s*(hai|chal)|"
+    r"news|khabar|headline|score|result|match|weather|mausam|temperature|"
+    r"stock|share|nifty|sensex|crypto|bitcoin|dollar|rupee|exchange|"
+    r"who\s+is\s+the\s+(current|new)|kaun\s+hai\s+(abhi|aaj)|"
+    r"release|launch|kab\s+(aa|aayega|aayegi|release))\b", re.I)
+# The model's classic excuse - if we see it, we fetch and ask again rather than shipping it.
+_NO_ACCESS_RE = re.compile(
+    r"real[- ]?time\s+(data|access|info|market)|live\s+(data|access)|"
+    r"access\s+nahi|internet\s+(ka\s+)?access\s+nahi|"
+    r"(can'?t|cannot|do\s+not|don'?t)\s+(have\s+)?access|"
+    r"internet\s+par\s+live|live\s+data\s+dekhna", re.I)
+
 # Per-kind budgets. One global number was too blunt: a file costs nothing (local bytes) while
 # an image hits Pollinations' ~45s-per-IP gate, so the tight limit belongs on images only.
 # These are PER CHAT, so the total scales with however many users you have - 100 users do not
@@ -3223,6 +3240,22 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             prompt = recent_chat_block(chat_id, speaker)
             _t2 = time.monotonic()
 
+            # ---- PRE-FLIGHT RESEARCH -------------------------------------------
+            # The model frequently answers a live-data question with "I cannot access the
+            # internet" instead of asking to search. For messages that are plainly about
+            # something that changes, fetch it FIRST so the answer has real figures.
+            pre_research = ""
+            if (RESEARCH_ENABLED and not media and text and len(text) > 4
+                    and _LIVE_HINT_RE.search(text) and action_allowed(chat_id, "search")):
+                pre_research = await free_web_search(text[:160], RESEARCH_RESULTS)
+                if pre_research:
+                    ctx += ("\n\n=== LIVE WEB RESULTS (fetched just now) ===\n" + pre_research +
+                            "\nThese are CURRENT, as of right now. Use them for any figure, "
+                            "rate or date. You DO have live access - never say you cannot "
+                            "access the internet.")
+                    log.info("pre-flight research for %r -> %s chars", text[:50],
+                             len(pre_research))
+
             ans = None
             if is_private and client is not None and ENABLE_STREAM:
                 ans = await ask_gemini_stream(chat_id, prompt, ctx,
@@ -3258,6 +3291,21 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     ans = ans2
                 else:
                     break
+            # If it STILL claims it has no live access, fetch and ask once more instead of
+            # shipping that excuse to the user.
+            if (RESEARCH_ENABLED and not pre_research and text
+                    and _NO_ACCESS_RE.search(ans or "")
+                    and action_allowed(chat_id, "search")):
+                log.info("answer claimed no live access - researching and retrying")
+                r2 = await free_web_search(text[:160], RESEARCH_RESULTS)
+                if r2:
+                    ans2 = await ask_gemini(
+                        chat_id, prompt,
+                        ctx + "\n\n=== LIVE WEB RESULTS (fetched just now) ===\n" + r2 +
+                        "\nAnswer using these. You DO have live access; do not say otherwise.",
+                        image, audio, doc)
+                    if ans2:
+                        ans = ans2
             ans = _SEARCH_TAG_RE.sub("", ans or "")      # never leak the tag to the user
             _t3 = time.monotonic()
 
@@ -3299,7 +3347,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 return
             clean = clean_reply(ans)
             if not clean:
-                clean = ans.strip() if ans.strip() else "✅"
+                # The reply was nothing but internal tags (e.g. only "[react:😳]"). Falling
+                # back to the RAW text leaked the tag into the chat as visible text, so strip
+                # the tags properly and, if truly nothing is left, send a neutral line.
+                leftover = _ANY_TAG_RE.sub("", strip_tag_partial(ans or "")).strip()
+                clean = leftover if leftover else "✅"
             log_line(chat_id, "VIDEX", clean)
 
             for url in find_image_urls(clean)[:2]:
