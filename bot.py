@@ -1195,7 +1195,9 @@ def split_text(text: str, limit: int = None) -> list:
     if len(text) <= limit:
         return [text]
     # Leave headroom so re-opening a marker below can never push a chunk past the limit.
-    eff = max(40, limit - 16)
+    # (The old value was a flat `max(40, limit-16)`, which made chunks LARGER than `limit`
+    # whenever limit < 56.)
+    eff = max(1, limit - min(16, max(1, limit // 4)))
     parts, rest = [], text
     while len(rest) > eff:
         chunk = rest[:eff]
@@ -1219,11 +1221,14 @@ def split_text(text: str, limit: int = None) -> list:
     # span that opened near the START leaked its raw marker.)
     out, carry = [], []
     for p in parts:
-        if carry:
+        if carry and len("".join(carry)) + len(p) <= limit:
             p = "".join(carry) + p
         opened = [mk for mk in ("**", "~~", "||", "`") if p.count(mk) % 2 == 1]
-        if opened:
-            p = p + "".join(opened)
+        add = "".join(opened)
+        if add and len(p) + len(add) <= limit:      # only close if it still fits
+            p = p + add
+        else:
+            opened = []
         carry = opened
         out.append(p)
     return out

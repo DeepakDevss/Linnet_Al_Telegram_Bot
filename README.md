@@ -3,7 +3,7 @@
 A Telegram AI bot written in Python. It holds conversations, understands media, remembers users across sessions, and can reply with text or voice.
 
 - Bot: https://t.me/Linnet_Agents_Bot  (the handle keeps its old name; the bot itself is VIDEX)
-- Repository: https://github.com/DeepakDevss/Linnet_Al_Telegram_Bot
+- Repository: https://github.com/DeepakDevss/VIDEX_Al_Telegram_Bot
 
 ---
 
@@ -43,8 +43,8 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 Clone the repo and install the dependencies:
 
 ```bash
-git clone https://github.com/DeepakDevss/Linnet_Al_Telegram_Bot.git
-cd Linnet_Al_Telegram_Bot
+git clone https://github.com/DeepakDevss/VIDEX_Al_Telegram_Bot.git
+cd VIDEX_Al_Telegram_Bot
 
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
@@ -89,7 +89,7 @@ Command handlers are registered in `bot.py`. Check that file for the full list o
 ## Project structure
 
 ```
-Linnet_Al_Telegram_Bot/
+VIDEX_Al_Telegram_Bot/
 ├── bot.py              Main application logic (kept as one file on purpose)
 ├── memory.py           Persistent JSON store for users and chats
 ├── requirements.txt    Python dependencies
@@ -158,7 +158,7 @@ Issues and pull requests are welcome.
 ## Related projects
 
 - **Ongoing Links** — A Telegram community bot with a force-join gate, welcome messages, referral tracking, and AI chat.
-  Repository: https://github.com/DeepakDevss/Telegram_Invited_AIBot
+  Repository: https://github.com/DeepakDevss/Ongoing_Links_Bot
   Bot: https://t.me/ANIME_WORLD_8BOT
 
 ---
