@@ -674,7 +674,7 @@ SYSTEM_PROMPT = (
     "  (Sent as the ONLY content. The bot then sends nothing at all.)"
     "\n"
     "=== LAYER 8c — YOUR OWN TOOLS (silent; use only when they genuinely help) ===\n"
-    "You have five tools. They run SILENTLY: the person is never told, so NEVER mention a "
+    "You have six tools. They run SILENTLY: the person is never told, so NEVER mention a "
     "tool, never say you 'searched' or 'made a file', and never print these tags as text - "
     "they are instructions, not content.\n"
     "1. [search: <query>] - look something up on the live web. YOU MUST USE IT whenever the "
@@ -701,6 +701,10 @@ SYSTEM_PROMPT = (
     "4. [image: <description>] - create an image. Use it ONLY when they clearly want to SEE "
     "something (they ask for a picture, drawing, design, logo or art, or a visual genuinely "
     "explains it). NEVER for normal questions.\n"
+    "6. [remind: <when> | <what>] - set a reminder for the person. Use it whenever they ask "
+    "to be reminded, or mention a future thing they must not forget. <when> is a short delay "
+    "like 20m, 2h, 1d, or 'in 30 minutes'. Example: [remind: 2h | call the plumber]. The "
+    "reminder is delivered automatically when due; confirm it briefly in your reply.\n"
     "5. [calc: <expression>] - evaluate arithmetic EXACTLY. Use it for ANY calculation - "
     "percentages, totals, unit maths, big multiplications - instead of doing it in your head. "
     "Emit the tag ALONE on its own line; the system computes it and asks you again with the "
@@ -992,7 +996,7 @@ _KNOWN_LOADED = False
 # A user must not be able to poison the transcript the model reads: no faking the
 # 'Name: what they said' format, and no injecting our internal tags.
 _TAG_INJECT_RE = re.compile(
-    r"\[(?:react|quote|remember|image|calc|search|file|voice)\b[^\]]*\]", re.I)
+    r"\[(?:react|quote|remember|image|calc|search|file|voice|remind)\b[^\]]*\]", re.I)
 _FAKE_NAME_RE = re.compile(r"^\s*[A-Za-z0-9_@.\- ]{1,32}:\s+")
 # Characters used to smuggle hidden instructions past the model: zero-width spaces/joiners,
 # bidi controls, the Unicode tag block (U+E0000-E007F), variation selectors and other format
@@ -1279,6 +1283,7 @@ def clean_reply(text: str) -> str:
     t = _FILE_BLOCK_RE.sub("", t)      # whole file blocks first (they span lines)
     t = _SEARCH_TAG_RE.sub("", t)
     t = _CALC_RE.sub("", t)
+    t = _REMIND_TAG_RE.sub("", t)
     t = _VOICE_TAG_RE.sub("", t)
     t = _AUTO_IMAGE_RE.sub("", t)
     t = _QUOTE_TAG_RE.sub("", _REMEMBER_TAG_RE.sub(
@@ -2008,6 +2013,68 @@ def _guess_filename(text: str, body: str) -> str:
         if kw in low:
             return name
     return "videx_notes.md"
+
+
+# ---- Reminders (pure code, no API) -----------------------------------------------------
+# The model can set a reminder with [remind: 30m | drink water], and people can also use
+# /remind. Everything is stored per-user and a background loop delivers it when due.
+_REMIND_TAG_RE = re.compile(r"\[\s*remind\s*:\s*([^\]\n]{3,200})\]", re.I)
+_REL_UNIT = {"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+             "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+             "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+             "d": 86400, "day": 86400, "days": 86400}
+_WHEN_UNITS = "seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d"
+_WHEN_RE = re.compile(
+    r"\b(?:in|after|baad|bad)\s+(\d{1,4})\s*(" + _WHEN_UNITS + r")\b"
+    r"|\b(\d{1,4})\s*(" + _WHEN_UNITS + r")\s*"
+    r"(?:me|mein|baad|bad|after|later)\b"
+    r"|^\s*(\d{1,4})\s*(" + _WHEN_UNITS + r")\s*$"
+    r"|^\s*(\d{1,4})\s*(" + _WHEN_UNITS + r")\b",
+    re.I)
+MAX_REMIND_DELAY = int(os.environ.get("MAX_REMIND_DELAY", str(366 * 86400)) or str(366 * 86400))
+
+
+def _parse_when(text: str):
+    """Pull a relative duration out of text. Returns (seconds, remainder) or None."""
+    m = _WHEN_RE.search(text or "")
+    if not m:
+        return None
+    n = int(m.group(1) or m.group(3) or m.group(5) or m.group(7) or 0)
+    unit = (m.group(2) or m.group(4) or m.group(6) or m.group(8) or "m").lower()
+    secs = n * _REL_UNIT.get(unit, 60)
+    if secs <= 0 or secs > MAX_REMIND_DELAY:
+        return None
+    rest = re.sub(r"\s+", " ", (text[:m.start()] + " " + text[m.end():])).strip(" ,.-|")
+    return secs, rest
+
+
+def parse_reminder(arg: str):
+    """'30m | drink water' or 'in 2h call mom' -> (due_ts, what). due_ts is None if no time."""
+    arg = (arg or "").strip()
+    if not arg:
+        return None, ""
+    if "|" in arg:
+        when, what = arg.split("|", 1)
+        p = _parse_when(when.strip())
+        return (time.time() + p[0], what.strip()) if p else (None, what.strip())
+    p = _parse_when(arg)
+    if not p:
+        return None, arg
+    return time.time() + p[0], (p[1] or "").strip()
+
+
+def _fmt_when(ts: float) -> str:
+    """Human 'in 2h' / 'at 09:30' string for a due timestamp."""
+    d = int(ts - time.time())
+    if d < 60:
+        return "in a moment"
+    if d < 3600:
+        return f"in {round(d / 60)} min"
+    if d < 86400:
+        return f"in {round(d / 3600, 1)} h"
+    return "on " + time.strftime("%d %b %H:%M", time.localtime(ts))
+
+
 _SEARCH_TAG_RE = re.compile(r"\[\s*search\s*:\s*([^\]\n]{3,200})\]", re.I)
 _CALC_RE = re.compile(r"\[\s*calc\s*:\s*([^\]\n]{1,200})\]", re.I)
 # Arithmetic only, evaluated by walking the AST - NEVER eval() on model or user text.
@@ -2768,6 +2835,8 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/myphoto - describe my profile picture\n/logo - describe your logo\n"
         "/id - your Telegram ID\n/clear - clear chat memory\n"
         "/forget - delete everything I stored about you\n"
+        "/remind 30m <kaam> - set a reminder (also: 'remind me in 2h to call mom')\n"
+        "/reminders - list your reminders\n/delremind <id> - delete one\n"
         "/research <query> - look something up on the live web\n\n"
         "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
 # Command menus. Telegram's BotFather /setcommands can only publish ONE list for everyone,
@@ -2797,6 +2866,9 @@ PUBLIC_COMMANDS = [
     ("id", "Your Telegram ID"),
     ("clear", "Clear this chat's memory"),
     ("forget", "Delete everything I stored about you"),
+    ("remind", "Set a reminder: /remind 30m drink water"),
+    ("reminders", "List your reminders"),
+    ("delremind", "Delete a reminder by its id"),
 ]
 OWNER_COMMANDS = [
     ("diag", "Diagnostics + live self-test"),
@@ -3668,6 +3740,16 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         _maybe_compact_memory(u.effective_user.id)
                     except Exception as e:  # noqa: BLE001
                         log.debug("remember failed: %s", e)
+            rmm = _REMIND_TAG_RE.search(ans or "")
+            if rmm:
+                ans = _REMIND_TAG_RE.sub("", ans or "").strip()
+                due, what = parse_reminder(rmm.group(1))
+                if due and what and MEM is not None:
+                    try:
+                        if MEM.add_reminder(u.effective_user.id, chat_id, what, due):
+                            log.info("reminder set for %s (silent tool)", u.effective_user.id)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("remind failed: %s", e)
             if not reacted:
                 emoji = find_reaction(ans)
                 if emoji:
@@ -3917,6 +3999,38 @@ async def _cleanup_loop() -> None:
             await _cleanup_once()
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup failed: %s", e)
+
+
+# ---- Reminder delivery ----------------------------------------------------------------
+REMINDER_CHECK = float(os.environ.get("REMINDER_CHECK", "30") or "30")
+_APP_BOT = None                    # set in _post_init; used by the reminder loop
+
+
+async def _check_reminders_once(bot=None) -> int:
+    """Send every reminder that is due. Returns how many were sent (one pass - testable)."""
+    if MEM is None:
+        return 0
+    b = bot or _APP_BOT
+    sent = 0
+    for r in MEM.due_reminders():
+        MEM.pop_reminder(r.get("id"))     # pop FIRST, so a failed send never loops forever
+        if b is None:
+            continue
+        try:
+            await b.send_message(chat_id=r.get("chat_id"), text=f"⏰ Reminder: {r.get('text')}")
+            sent += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("reminder send failed: %s", str(e)[:120])
+    return sent
+
+
+async def _reminder_loop() -> None:
+    while True:
+        await asyncio.sleep(REMINDER_CHECK)
+        try:
+            await _check_reminders_once()
+        except Exception as e:  # noqa: BLE001
+            log.warning("reminder loop failed: %s", str(e)[:120])
 
 
 # ============================ PART 15: PROACTIVE INTELLIGENCE ============================
@@ -4627,8 +4741,11 @@ async def _post_init(app) -> None:
         log.info("Webhook cleared; using long polling.")
     except Exception as e:  # noqa: BLE001
         log.warning("delete_webhook failed (ignored): %s", e)
+    global _APP_BOT
+    _APP_BOT = app.bot
     app.create_task(_cleanup_loop())
     app.create_task(_proactive_loop(app.bot))          # no-op unless opted in
+    app.create_task(_reminder_loop())                  # delivers reminders when due
     await _setup_commands(app)
 
 
@@ -4821,6 +4938,57 @@ async def cmd_voicelist(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(body[:3800])
 
 
+async def cmd_remind(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set a reminder from a command: /remind 30m drink water  (or  30m | drink water)."""
+    chat_id = u.effective_chat.id
+    if MEM is None:
+        await _send_plain(c.bot, chat_id, "Reminders abhi available nahi hain.")
+        return
+    arg = " ".join(c.args or []).strip()
+    due, what = parse_reminder(arg)
+    if not due or not what:
+        await _send_plain(c.bot, chat_id,
+                          "Format: /remind 30m <kaam>\n"
+                          "Time likhne ke tareeke: 10m, 2h, 1d, 'in 30 minutes'.")
+        return
+    rid = MEM.add_reminder(u.effective_user.id, chat_id, what, due)
+    if not rid:
+        await _send_plain(c.bot, chat_id, "Reminder save nahi hua (limit bhar gaya ho sakta hai).")
+        return
+    await _send_plain(c.bot, chat_id, f"⏰ Reminder #{rid} {_fmt_when(due)}: {what}")
+
+
+async def cmd_reminders(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """List this person's own reminders (never anyone else's)."""
+    chat_id = u.effective_chat.id
+    if MEM is None:
+        await _send_plain(c.bot, chat_id, "Reminders abhi available nahi hain.")
+        return
+    rs = MEM.list_reminders(u.effective_user.id)
+    if not rs:
+        await _send_plain(c.bot, chat_id, "Koi reminder set nahi hai.\n/remind 30m <kaam>")
+        return
+    lines = [f"⏰ Tumhare reminders ({len(rs)}):"]
+    for r in rs[:20]:
+        lines.append(f"#{r['id']} — {r['text']} ({_fmt_when(r['due'])})")
+    lines.append("\nHatane ke liye: /delremind <id>")
+    await _send_plain(c.bot, chat_id, "\n".join(lines))
+
+
+async def cmd_delremind(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete one of your own reminders by its id."""
+    chat_id = u.effective_chat.id
+    if MEM is None:
+        await _send_plain(c.bot, chat_id, "Reminders abhi available nahi hain.")
+        return
+    arg = (c.args or [""])[0] if c.args else ""
+    rid = int(re.sub(r"[^0-9]", "", arg) or 0)
+    if not rid or not MEM.del_reminder(u.effective_user.id, rid):
+        await _send_plain(c.bot, chat_id, "Us id ka koi reminder nahi mila. /reminders")
+        return
+    await _send_plain(c.bot, chat_id, f"🗑 Reminder #{rid} hata diya.")
+
+
 async def cmd_proactive(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """Opt in/out of proactive suggestions. Off by default, and one word turns it off."""
     if MEM is None:
@@ -4999,6 +5167,9 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("voicemessage", cmd_voicemessage))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("remind", cmd_remind))
+    app.add_handler(CommandHandler("reminders", cmd_reminders))
+    app.add_handler(CommandHandler("delremind", cmd_delremind))
     app.add_handler(CommandHandler("ai", cmd_ai))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("welcome", cmd_welcome))

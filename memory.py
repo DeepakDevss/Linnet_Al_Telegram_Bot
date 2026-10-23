@@ -37,9 +37,11 @@ MAX_CHATS_PER_USER = int(os.environ.get("MEMORY_MAX_CHATS", "0") or "0")
 # A compact, LLM-written profile (see the bot's compaction job) - replaces a long list of raw
 # notes with one tidy summary. This is what actually gets injected into the prompt.
 MAX_PROFILE_LEN = int(os.environ.get("MEMORY_MAX_PROFILE_LEN", "900") or "900")
+# Max pending reminders per user (0 = unlimited).
+MAX_REMINDERS = int(os.environ.get("MEMORY_MAX_REMINDERS", "50") or "50")
 
 _LOCK = threading.Lock()
-_DATA = {"users": {}, "chats": {}}
+_DATA = {"users": {}, "chats": {}, "reminders": {}, "seq": 0}
 _LOADED = False
 
 # AI names we quietly count when a user talks about them.
@@ -73,6 +75,8 @@ def load() -> None:
         if isinstance(raw, dict):
             _DATA["users"] = raw.get("users", {}) or {}
             _DATA["chats"] = raw.get("chats", {}) or {}
+            _DATA["reminders"] = raw.get("reminders", {}) or {}
+            _DATA["seq"] = int(raw.get("seq", 0) or 0)
         if path == _OLD_MEMORY_FILE:
             save(force=True)          # write it out under the new name right away
     except FileNotFoundError:
@@ -302,6 +306,70 @@ def clear_notes(user_id) -> int:
     if n:
         save()
     return n
+
+
+# ------------------------------------------------------------------ reminders
+def add_reminder(user_id, chat_id, text: str, due: float) -> int:
+    """Store a reminder for ONE user (isolated by their id). Returns its id, or 0 if rejected."""
+    text = safe_mem(text, 200)
+    if not text or user_id is None or not due:
+        return 0
+    load()
+    uid = str(user_id)
+    with _LOCK:
+        rem = _DATA.setdefault("reminders", {})
+        mine = sum(1 for r in rem.values() if str(r.get("uid")) == uid)
+        if MAX_REMINDERS and mine >= MAX_REMINDERS:
+            return 0
+        _DATA["seq"] = int(_DATA.get("seq", 0)) + 1
+        rid = int(_DATA["seq"])
+        rem[str(rid)] = {"uid": uid, "chat_id": chat_id, "text": text,
+                         "due": float(due), "created": int(time.time())}
+    save()
+    return rid
+
+
+def due_reminders(now=None) -> list:
+    load()
+    now = time.time() if now is None else now
+    with _LOCK:
+        return [dict(r, id=int(k)) for k, r in (_DATA.get("reminders") or {}).items()
+                if float(r.get("due", 0)) <= now]
+
+
+def pop_reminder(rid) -> dict:
+    load()
+    with _LOCK:
+        r = (_DATA.get("reminders") or {}).pop(str(rid), None)
+    if r:
+        save()
+    return r or {}
+
+
+def list_reminders(user_id) -> list:
+    load()
+    uid = str(user_id)
+    with _LOCK:
+        out = [dict(r, id=int(k)) for k, r in (_DATA.get("reminders") or {}).items()
+               if str(r.get("uid")) == uid]
+    out.sort(key=lambda r: r.get("due", 0))
+    return out
+
+
+def del_reminder(user_id, rid) -> bool:
+    load()
+    uid = str(user_id)
+    with _LOCK:
+        r = (_DATA.get("reminders") or {}).get(str(rid))
+        if not r or str(r.get("uid")) != uid:
+            return False
+        _DATA["reminders"].pop(str(rid), None)
+    save()
+    return True
+
+
+def count_reminders(user_id) -> int:
+    return len(list_reminders(user_id))
 
 
 def user_basic(user_id) -> str:
