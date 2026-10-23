@@ -984,7 +984,7 @@ _THINKING_OK = True
 CHAT_LOG: dict = defaultdict(lambda: deque(maxlen=LOG_LINES))   # chat_id -> deque[(who, text)]
 _CHAT_SEEN: dict = {}          # chat_id -> epoch of its last logged line (for pruning)
 MEMBERS: dict = {}
-CHAT_LOCKS: dict = {}
+TURN_LOCKS: dict = {}          # (chat_id, user_id) -> asyncio.Lock, serialises ONE person's turns
 _SEND_TIMES: dict = defaultdict(deque)
 _KNOWN_LOADED = False
 
@@ -1047,11 +1047,18 @@ def recent_chat_block(chat_id: int, speaker: str) -> str:
     return body
 
 
-def chat_lock(chat_id: int) -> asyncio.Lock:
-    lk = CHAT_LOCKS.get(chat_id)
+def turn_lock(chat_id: int, uid) -> asyncio.Lock:
+    """Serialise one PERSON's turns, not the whole chat.
+
+    The old lock was per CHAT, so in a busy group every person waited for the one before -
+    the group became a queue. Keying on (chat_id, user_id) keeps each person's messages in
+    order while letting different people be answered at the same time.
+    """
+    key = (chat_id, uid or 0)
+    lk = TURN_LOCKS.get(key)
     if lk is None:
         lk = asyncio.Lock()
-        CHAT_LOCKS[chat_id] = lk
+        TURN_LOCKS[key] = lk
     return lk
 
 
@@ -1953,6 +1960,54 @@ _FILE_BLOCK_RE = re.compile(
     r"\[\s*file\s*:\s*([^\]\n]{1,60}?)\s*\]\s*(.*?)\s*\[\s*/\s*file\s*\]", re.S | re.I)
 _VOICE_TAG_RE = re.compile(r"\[\s*(?:voice|voicereply|voice reply)\s*\]", re.I)
 _AUTO_IMAGE_RE = re.compile(r"\[\s*image\s*:\s*([^\]]{3,300})\]", re.I)
+
+# ---- Natural-language intent fallbacks ------------------------------------------------
+# The model normally emits [file:] / [image:] by itself. When it does not, these catch a
+# PLAIN-WORD request (no command) so the person still gets the artefact they asked for.
+_FILE_EXT_RE = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9._\-]{0,40}\.(?:md|txt|csv|json|py|html|xml|yaml|yml|sql|js|css))\b",
+    re.I)
+_FILE_WANT_RE = re.compile(
+    r"\.(?:md|txt|csv|json|py|html|xml|yaml|yml|sql|js|css)\b"
+    r"|\b(?:file|document|report|notes?|story|script|code|csv|json|checklist|draft|plan|"
+    r"resume|letter|essay)\b[^.\n]{0,40}?\b(?:bana|banao|banaye|banaao|create|make|write|"
+    r"generate|save|download|attach|export|dedo|de\s*do)\b"
+    r"|\b(?:bana|banao|create|make|write|generate|save|download|attach|export)\b[^.\n]{0,30}?"
+    r"\b(?:file|document|report|notes?|story|script|code|csv|json|checklist|draft)\b",
+    re.I)
+_IMAGE_WANT_RE = re.compile(
+    r"\b(?:image|photo|picture|pic|drawing|logo|poster|design|art|wallpaper|tasveer|chitra)\b"
+    r"[^.\n]{0,30}?\b(?:bana|banao|banaye|banaao|create|make|generate|draw|dedo|de\s*do|chahiye)\b"
+    r"|\b(?:bana|banao|create|make|generate|draw)\b[^.\n]{0,25}?"
+    r"\b(?:image|photo|picture|pic|drawing|logo|poster|design|art|wallpaper)\b"
+    r"|^\s*(?:draw|sketch|paint|illustrate)\b",
+    re.I)
+# A reply must be at least this long before it is turned into a file automatically.
+FILE_FALLBACK_MIN = int(os.environ.get("FILE_FALLBACK_MIN", "400") or "400")
+
+
+def _file_requested(text: str) -> bool:
+    return bool(_FILE_WANT_RE.search(text or ""))
+
+
+def _image_requested(text: str) -> bool:
+    return bool(_IMAGE_WANT_RE.search(text or ""))
+
+
+def _guess_filename(text: str, body: str) -> str:
+    """Pick a sensible file name for an auto-attached reply (md/txt/csv/... by topic)."""
+    m = _FILE_EXT_RE.search(text or "")
+    if m:
+        return safe_filename(m.group(1))
+    low = (text or "").lower()
+    for kw, name in (("csv", "data.csv"), ("json", "data.json"), ("python", "script.py"),
+                     ("script", "script.py"), ("html", "page.html"), ("report", "report.md"),
+                     ("story", "story.md"), ("plan", "plan.md"), ("checklist", "checklist.md"),
+                     ("notes", "notes.md"), ("resume", "resume.md"), ("letter", "letter.md"),
+                     ("essay", "essay.md"), ("code", "code.md")):
+        if kw in low:
+            return name
+    return "videx_notes.md"
 _SEARCH_TAG_RE = re.compile(r"\[\s*search\s*:\s*([^\]\n]{3,200})\]", re.I)
 _CALC_RE = re.compile(r"\[\s*calc\s*:\s*([^\]\n]{1,200})\]", re.I)
 # Arithmetic only, evaluated by walking the AST - NEVER eval() on model or user text.
@@ -3436,7 +3491,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
     lang = detect_language(text, chat_id)
     CHAT_LANG[chat_id] = lang
 
-    async with chat_lock(chat_id):
+    async with turn_lock(chat_id, getattr(u.effective_user, "id", 0)):
         stop_evt = asyncio.Event()
         typing_task = asyncio.create_task(_typing_loop(c.bot, chat_id, stop_evt))
         reacted = False
@@ -3584,11 +3639,13 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # Each type is BUDGETED (see action_allowed) so it cannot fire every single time
             # and burn the free quotas.
             auto_image = ""
+            file_sent = False
             for fm in list(_FILE_BLOCK_RE.finditer(ans or ""))[:2]:
                 fname, fbody = fm.group(1).strip(), fm.group(2)
                 ans = (ans or "").replace(fm.group(0), "").strip()
                 if fbody.strip() and action_allowed(chat_id, "file"):
-                    await send_made_file(c.bot, chat_id, fname, fbody)
+                    if await send_made_file(c.bot, chat_id, fname, fbody):
+                        file_sent = True
             if _VOICE_TAG_RE.search(ans or ""):
                 ans = _VOICE_TAG_RE.sub("", ans or "").strip()
                 want_voice = True
@@ -3597,6 +3654,10 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 ans = _AUTO_IMAGE_RE.sub("", ans or "").strip()
                 if action_allowed(chat_id, "image"):
                     auto_image = am.group(1).strip()
+            elif text and _image_requested(text) and action_allowed(chat_id, "image"):
+                # No [image:] tag, but they asked for a picture in plain words (no command).
+                auto_image = text.strip()[:200]
+                log.info("auto-image from a plain-word request for chat %s", chat_id)
 
             rem = _REMEMBER_TAG_RE.search(ans)
             if rem:
@@ -3643,6 +3704,15 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 if not clean:
                     clean = ("Sorry, jawab banate waqt kuch technical dikkat aa gayi. "
                              "Ek baar dobara bhejo.")
+            # ---- NATURAL-LANGUAGE FILE FALLBACK ---------------------------------
+            # The model did not emit [file:], but the person clearly asked for a file in plain
+            # words (no command). If the answer is substantial, attach it as a real download.
+            if (not file_sent and text and _file_requested(text)
+                    and len(clean) >= FILE_FALLBACK_MIN and action_allowed(chat_id, "file")):
+                if await send_made_file(c.bot, chat_id, _guess_filename(text, clean), clean):
+                    file_sent = True
+                    log.info("auto-attached a file for chat %s (plain-word request)", chat_id)
+
             log_line(chat_id, "VIDEX", clean)
 
             for url in find_image_urls(clean)[:2]:
@@ -3797,10 +3867,11 @@ async def _cleanup_once() -> None:
         dq = _SEND_TIMES.get(k)
         if not dq or dq[-1] < cutoff:
             _SEND_TIMES.pop(k, None)
-    for k in list(CHAT_LOCKS):
-        lk = CHAT_LOCKS.get(k)
-        if lk is not None and not lk.locked() and k not in _SEND_TIMES:
-            CHAT_LOCKS.pop(k, None)
+    for k in list(TURN_LOCKS):
+        lk = TURN_LOCKS.get(k)
+        chat_of = k[0] if isinstance(k, tuple) else k
+        if lk is not None and not lk.locked() and chat_of not in _SEND_TIMES:
+            TURN_LOCKS.pop(k, None)
     # The recent-chat transcript was never pruned - it grew by one entry for every chat the
     # bot had EVER seen (a slow leak). Drop chats that have been quiet for a while.
     for k in list(CHAT_LOG):
@@ -3828,7 +3899,7 @@ async def _cleanup_once() -> None:
         if time.time() - _SEARCH_CACHE[k][0] > SEARCH_CACHE_TTL:
             _SEARCH_CACHE.pop(k, None)
     log.info("cleanup: locks=%s send_times=%s logs=%s actions=%s cache=%s",
-             len(CHAT_LOCKS), len(_SEND_TIMES), len(CHAT_LOG),
+             len(TURN_LOCKS), len(_SEND_TIMES), len(CHAT_LOG),
              len(_ACTION_LAST), len(_SEARCH_CACHE))
     # Retention purge (the automated job privacy-policy.md promises).
     if MEM is not None and MEMORY_RETENTION_DAYS:
