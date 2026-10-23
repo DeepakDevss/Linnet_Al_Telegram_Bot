@@ -2891,7 +2891,11 @@ async def cmd_research(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     if not ans or ans == BUSY_MSG:
         await _send_plain(c.bot, chat_id, results[:3500])
         return
-    for chunk in split_text(clean_reply(ans)):
+    clean = clean_reply(ans)
+    if not clean:
+        # The model returned only tags/emptiness - send the raw findings instead of nothing.
+        clean = results[:3500]
+    for chunk in split_text(clean):
         await _safe_send(u, c, md_to_html(chunk), chunk)
 
 
@@ -3316,16 +3320,20 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     break
             # If it STILL claims it has no live access, fetch and ask once more instead of
             # shipping that excuse to the user.
-            if (RESEARCH_ENABLED and not pre_research and text
-                    and _NO_ACCESS_RE.search(ans or "")
-                    and action_allowed(chat_id, "search")):
-                log.info("answer claimed no live access - researching and retrying")
-                r2 = await free_web_search(text[:160], RESEARCH_RESULTS)
+            if (RESEARCH_ENABLED and text and _NO_ACCESS_RE.search(ans or "")):
+                # The model claimed it has no live access. If pre-flight research already
+                # fetched data, REUSE it (no second lookup, no extra budget); otherwise fetch
+                # now - but only if the search budget still allows it.
+                r2 = pre_research
+                if not r2 and action_allowed(chat_id, "search"):
+                    r2 = await free_web_search(text[:160], RESEARCH_RESULTS)
                 if r2:
+                    log.info("answer claimed no live access - retrying with the live data")
                     ans2 = await ask_gemini(
                         chat_id, prompt,
                         ctx + "\n\n=== LIVE WEB RESULTS (fetched just now) ===\n" + r2 +
-                        "\nAnswer using these. You DO have live access; do not say otherwise.",
+                        "\nThese are CURRENT. You DO have live access - answer using them and "
+                        "never say you cannot access the internet.",
                         image, audio, doc)
                     if ans2:
                         ans = ans2
@@ -3370,20 +3378,26 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 return
             clean = clean_reply(ans)
             if not clean:
-                # Two very different cases, and they must NOT look the same to the user:
-                #  1) the reply was nothing but internal tags (e.g. only "[react:😳]") -> a
-                #     bare tick is fine, the reaction itself was the answer.
-                #  2) the model returned NOTHING AT ALL (empty / truncated) -> a bare "✅" looked
-                #     like the bot ignoring them, so say something real instead.
-                leftover = _ANY_TAG_RE.sub("", strip_tag_partial(ans or "")).strip()
-                if leftover:
-                    clean = leftover
-                elif not (ans or "").strip():
-                    log.warning("model returned an EMPTY answer for chat %s", chat_id)
-                    clean = ("Kuch technical issue aa gaya aur jawab khaali aa gaya. "
+                # The reply carried NO visible text: the model returned only internal tags
+                # (usually a lone "[react:..]") or nothing at all. NEVER send a bare emoji or a
+                # raw tag as the whole answer - that reads as the bot ignoring the person.
+                # Ask ONCE more for the plain text, then fall back to an honest line.
+                log.warning("no visible text for chat %s (ans=%r) - asking once more",
+                            chat_id, (ans or "")[:120])
+                retry = None
+                try:
+                    retry = await ask_gemini(
+                        chat_id, prompt,
+                        ctx + "\n\n=== IMPORTANT ===\nYour previous reply had NO answer text. "
+                              "Reply NOW with ONLY your answer text, in the user's language - "
+                              "no [react:], no [search:], no [file:], no tags of any kind.",
+                        image, audio, doc)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("empty-reply retry failed: %s", str(e)[:120])
+                clean = clean_reply(retry) if (retry and retry != BUSY_MSG) else ""
+                if not clean:
+                    clean = ("Sorry, jawab banate waqt kuch technical dikkat aa gayi. "
                              "Ek baar dobara bhejo.")
-                else:
-                    clean = "✅"
             log_line(chat_id, "VIDEX", clean)
 
             for url in find_image_urls(clean)[:2]:
@@ -3595,25 +3609,66 @@ _PROACTIVE_PENDING: set = set()
 #     policy") and requires a DESCRIPTIVE agent with contact info.
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
 _UA_BOT = "VIDEXBot/1.0 (Telegram assistant; +https://t.me/Linnet_Agents_Bot)"
+# DDG's lite endpoint answers a bare request with HTTP 202 (a soft bot check) unless the
+# request looks like a browser. An Accept-Language header is what flips it to 200, and a
+# Referer helps. Both are set on every DDG request below.
+_DDG_HEADERS = {"User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://lite.duckduckgo.com/"}
+_DDG_LAST = 0.0          # epoch of the last DDG request (for the throttle below)
+_DDG_MIN_GAP = 1.5       # minimum seconds between two DDG requests
 
 
 def _strip_html(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s or "")).strip()
 
 
-async def _ddg_lite(query: str, n: int) -> list:
-    """DuckDuckGo's 'lite' endpoint - the one that actually still answers.
+async def _ddg_lite_html(query: str) -> str:
+    """Fetch DuckDuckGo's results page as HTML, with retries.
 
-    It is a plain HTML table. NOTE the attributes use SINGLE quotes (class='result-link'),
-    which is why a double-quote regex silently matched nothing.
+    DDG answers a bare request with HTTP 202 (a soft bot check) unless the request looks
+    like a browser - an Accept-Language header is what flips it to 200. We retry, then try
+    a GET form query, then the html/ endpoint. Returns '' if every attempt failed.
     """
-    r = await HTTP.post("https://lite.duckduckgo.com/lite/", data={"q": query},
-                        headers={"User-Agent": _UA})
-    if r.status_code != 200:
-        return []
-    html = r.text or ""
-    links = re.findall(r"class=['\"]result-link['\"][^>]*>(.*?)</a>", html, re.S | re.I)
-    snips = re.findall(r"class=['\"]result-snippet['\"][^>]*>(.*?)</td>", html, re.S | re.I)
+    # Be gentle: DDG soft-blocks (HTTP 202) an IP that fires requests too fast, so space our
+    # own requests out. This is a big part of why lookups used to come back empty.
+    global _DDG_LAST
+    gap = _DDG_MIN_GAP - (time.time() - _DDG_LAST)
+    if gap > 0:
+        await asyncio.sleep(gap)
+    for attempt in range(3):
+        _DDG_LAST = time.time()
+        try:
+            if attempt == 0:
+                r = await HTTP.post("https://lite.duckduckgo.com/lite/",
+                                    data={"q": query}, headers=_DDG_HEADERS)
+            elif attempt == 1:
+                r = await HTTP.get("https://lite.duckduckgo.com/lite/",
+                                   params={"q": query}, headers=_DDG_HEADERS)
+            else:
+                r = await HTTP.post("https://html.duckduckgo.com/html/",
+                                    data={"q": query}, headers=_DDG_HEADERS)
+            body = r.text or ""
+            if r.status_code == 200 and "result-link" in body:
+                return body
+            if r.status_code in (202, 429, 403):
+                await asyncio.sleep(0.8 * (attempt + 1))   # soft rate-limit / bot check
+                continue
+            if r.status_code == 200:
+                return body
+        except Exception as e:  # noqa: BLE001
+            log.debug("ddg lite attempt %s failed: %s", attempt, str(e)[:100])
+            await asyncio.sleep(0.6)
+    return ""
+
+
+def _ddg_lite_lines(html: str, n: int) -> list:
+    """Parse DuckDuckGo's 'lite' HTML table into result lines.
+
+    The attributes use SINGLE quotes (class='result-link'), which is why an earlier
+    double-quote regex silently matched nothing.
+    """
+    links = re.findall(r"class=['\"]result-link['\"][^>]*>(.*?)</a>", html or "", re.S | re.I)
+    snips = re.findall(r"class=['\"]result-snippet['\"][^>]*>(.*?)</td>", html or "", re.S | re.I)
     out = []
     for i, title in enumerate(links[:n]):
         t = _strip_html(title)
@@ -3621,6 +3676,11 @@ async def _ddg_lite(query: str, n: int) -> list:
         if t:
             out.append(f"- {t}: {s[:260]}")
     return out
+
+
+async def _ddg_lite(query: str, n: int) -> list:
+    """DuckDuckGo's 'lite' endpoint - the one that actually still answers."""
+    return _ddg_lite_lines(await _ddg_lite_html(query), n)
 
 
 async def _wikipedia(query: str, n: int = 3) -> list:
@@ -3640,7 +3700,7 @@ async def _wikipedia(query: str, n: int = 3) -> list:
     return out
 
 
-async def _ddg_instant(query: str) -> list:
+async def _ddg_instant(query: str, n: int = 3) -> list:
     """DuckDuckGo Instant Answer JSON - keyless; great for 'who/what is X', empty otherwise."""
     r = await HTTP.get("https://api.duckduckgo.com/",
                        params={"q": query, "format": "json", "no_html": "1",
@@ -3653,7 +3713,7 @@ async def _ddg_instant(query: str) -> list:
     if j.get("AbstractText"):
         src = j.get("AbstractSource") or "DuckDuckGo"
         out.append(f"- {src}: {_strip_html(j['AbstractText'])[:300]}")
-    for t in (j.get("RelatedTopics") or [])[:3]:
+    for t in (j.get("RelatedTopics") or [])[:n]:
         if isinstance(t, dict) and t.get("Text"):
             out.append(f"- {_strip_html(t['Text'])[:200]}")
     return out
@@ -3717,24 +3777,35 @@ async def free_web_search(query: str, n: int = 5, deep: bool = True) -> str:
         log.info("research cache hit for %r", query[:50])
         return hit[1]
     lines = []
-    for fn in (_ddg_lite, _wikipedia, _ddg_instant):
-        try:
-            res = await (fn(query, n) if fn is not _ddg_lite else fn(query, n))
-            if res:
-                log.info("research via %s -> %s results", fn.__name__, len(res))
-                lines = res[:n]
-                break
-        except Exception as e:  # noqa: BLE001
-            log.debug("research source %s failed: %s", fn.__name__, str(e)[:100])
+    # Fetch DDG ONCE and reuse the same html for the snippets AND the deep page URLs. A
+    # second request just gave DDG another chance to answer 202 and kill deep mode.
+    html = await _ddg_lite_html(query)
+    if html:
+        lines = _ddg_lite_lines(html, n)
+        if lines:
+            log.info("research via ddg lite -> %s results", len(lines))
+    if not lines:
+        for fn in (_wikipedia, _ddg_instant):
+            try:
+                res = await fn(query, n)
+                if res:
+                    log.info("research via %s -> %s results", fn.__name__, len(res))
+                    lines = res[:n]
+                    break
+            except Exception as e:  # noqa: BLE001
+                log.debug("research source %s failed: %s", fn.__name__, str(e)[:100])
     if not lines:
         return ""
     body = "\n".join(lines)
-    if deep and RESEARCH_DEEP:
+    if deep and RESEARCH_DEEP and html:
         try:
-            r2 = await HTTP.post("https://lite.duckduckgo.com/lite/", data={"q": query},
-                                 headers={"User-Agent": _UA})
-            urls = re.findall(r"href=['\"](https?://[^'\"]+)['\"]", r2.text or "")
-            urls = [u for u in urls if "duckduckgo.com" not in u][:RESEARCH_PAGES]
+            # Every DDG result is wrapped in a redirect: //duckduckgo.com/l/?uddg=<encoded>.
+            # The old code looked for href="http...", found none, and so deep research
+            # silently read NOTHING. Decode the uddg parameter to get the real page URL.
+            raw = re.findall(r"uddg=([^&\"'\s]+)", html)
+            urls = [urllib.parse.unquote(u) for u in raw]
+            urls = [u for u in urls
+                    if u.startswith("http") and "duckduckgo.com" not in u][:RESEARCH_PAGES]
             for u in urls:
                 txt = await _read_page(u, RESEARCH_PAGE_CHARS)
                 if txt and len(txt) > 200:

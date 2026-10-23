@@ -93,7 +93,7 @@ Linnet_Al_Telegram_Bot/
 ├── env.example.txt     Environment variable template
 ├── privacy-policy.md   Privacy policy
 ├── welcome.png         Image used in the group welcome message
-├── LICENSE             MIT
+├── LICENSE.txt         MIT
 └── README.md
 ```
 
@@ -170,4 +170,4 @@ Deepak Devs
 
 ## License
 
-MIT — see `LICENSE`.
+MIT — see `LICENSE.txt`.
