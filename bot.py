@@ -1194,31 +1194,39 @@ def split_text(text: str, limit: int = None) -> list:
     text = text or ""
     if len(text) <= limit:
         return [text]
+    # Leave headroom so re-opening a marker below can never push a chunk past the limit.
+    eff = max(40, limit - 16)
     parts, rest = [], text
-    while len(rest) > limit:
-        chunk = rest[:limit]
+    while len(rest) > eff:
+        chunk = rest[:eff]
         cut = chunk.rfind("\n")
-        if cut < limit // 2:
+        if cut < eff // 2:
             cut = max(chunk.rfind(". "), chunk.rfind("! "), chunk.rfind("? "))
-            if cut >= limit // 2:
+            if cut >= eff // 2:
                 cut += 1                       # keep the punctuation with its sentence
-        if cut < limit // 2:
+        if cut < eff // 2:
             cut = chunk.rfind(" ")
         if cut <= 0:
-            cut = limit
-        piece = rest[:cut].rstrip()
-        for mark in ("**", "~~", "||", "`"):
-            if piece.count(mark) % 2:          # marker opened here but not closed
-                j = piece.rfind(mark)
-                if j > limit // 4:
-                    piece = piece[:j].rstrip()
-        if not piece:
-            piece = rest[:limit]
+            cut = eff
+        piece = rest[:cut].rstrip() or rest[:eff]
         parts.append(piece)
         rest = rest[len(piece):].lstrip("\n ")
     if rest:
         parts.append(rest)
-    return parts
+    # If a markdown span (bold / strike / spoiler / code) is cut by a boundary, CLOSE it at the
+    # end of this chunk and RE-OPEN it at the start of the next, so the reader never sees a
+    # stray '**' or backtick. (The old code only trimmed a marker near the END of a chunk, so a
+    # span that opened near the START leaked its raw marker.)
+    out, carry = [], []
+    for p in parts:
+        if carry:
+            p = "".join(carry) + p
+        opened = [mk for mk in ("**", "~~", "||", "`") if p.count(mk) % 2 == 1]
+        if opened:
+            p = p + "".join(opened)
+        carry = opened
+        out.append(p)
+    return out
 
 
 # ============================ PART 8: REACTION TAG ============================
