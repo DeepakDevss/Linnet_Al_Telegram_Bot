@@ -1,6 +1,8 @@
 python-telegram-bot[rate-limiter]>=22.0
-google-genai>=1.0
-httpx
+# 2.25+ is REQUIRED: voice design (client.voices.create) and speech_metadata
+# (the TTS delivery style) do not exist in 1.x.
+google-genai>=2.25
+httpx>=0.27
 tzdata
 # Optional but recommended: gives a bundled ffmpeg so TTS replies arrive as a
 # real Telegram VOICE note (OGG/Opus). Without it, the bot still sends the audio

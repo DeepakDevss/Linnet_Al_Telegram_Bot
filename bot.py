@@ -3461,8 +3461,29 @@ async def _cleanup_loop() -> None:
                 lk = CHAT_LOCKS.get(k)
                 if lk is not None and not lk.locked() and k not in _SEND_TIMES:
                     CHAT_LOCKS.pop(k, None)
-            log.info("cleanup: locks=%s send_times=%s logs=%s",
-                     len(CHAT_LOCKS), len(_SEND_TIMES), len(CHAT_LOG))
+            # The autonomous-action / abuse-guard dicts are keyed by (chat, kind) or user
+            # and were never pruned - they grew for the life of the process.
+            _today = now_local().strftime("%Y-%m-%d")
+            for k in list(_ACTION_LAST):
+                if _ACTION_LAST[k] < cutoff:
+                    _ACTION_LAST.pop(k, None)
+            for k in list(_ACTION_DAY):
+                if _ACTION_DAY[k][0] != _today:
+                    _ACTION_DAY.pop(k, None)
+            for k in list(_USER_DAY):
+                if _USER_DAY[k][0] != _today:
+                    _USER_DAY.pop(k, None)
+            for k in list(_MEDIA_GROUPS):
+                _MEDIA_GROUPS.pop(k, None)      # an album still buffered an hour later is dead
+            for k in list(_ERR_TOLD):
+                if time.time() - _ERR_TOLD[k] > 3600:
+                    _ERR_TOLD.pop(k, None)
+            for k in list(_SEARCH_CACHE):
+                if time.time() - _SEARCH_CACHE[k][0] > SEARCH_CACHE_TTL:
+                    _SEARCH_CACHE.pop(k, None)
+            log.info("cleanup: locks=%s send_times=%s logs=%s actions=%s cache=%s",
+                     len(CHAT_LOCKS), len(_SEND_TIMES), len(CHAT_LOG),
+                     len(_ACTION_LAST), len(_SEARCH_CACHE))
             # Retention purge (the automated job privacy-policy.md promises).
             if MEM is not None and MEMORY_RETENTION_DAYS:
                 try:
@@ -3481,7 +3502,6 @@ _PROACTIVE_SENT: dict = {}          # chat_id -> (day_key, count_today)
 # Chats we sent a proactive message to that the person has NOT answered yet. We never stack
 # a second one on top - silence is respect, not something to be chased.
 _PROACTIVE_PENDING: set = set()
-_FREE_SEARCH_URL = "https://html.duckduckgo.com/html/"
 
 
 # Two different user agents on purpose - the two sites want opposite things:
@@ -3562,6 +3582,15 @@ async def _read_page(url: str, limit: int = 1200) -> str:
     the meatiest chunk. Best-effort - any failure returns ''.
     """
     if not url or not url.startswith("http"):
+        return ""
+    # SSRF guard: these URLs come from search results, not from us, so never let one point
+    # at localhost or a private/link-local address.
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if (not host or host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+            or host.endswith(".local") or host.endswith(".internal")
+            or host.startswith(("10.", "192.168.", "169.254.", "127."))
+            or re.match(r"^172\.(1[6-9]|2\d|3[01])\.", host)):
+        log.debug("research: refusing a private-looking URL %s", host)
         return ""
     try:
         r = await HTTP.get(url, headers={"User-Agent": _UA}, timeout=12)
@@ -3779,8 +3808,9 @@ async def cmd_voicepreview(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         name = _chat_voice(chat_id)
     if name not in VOICE_NAMES and not name.startswith("voice_"):
         lines = ["Usage: /voicepreview <name>", "", "Best picks: " + ", ".join(TOP_VOICES),
-                 "", "All voices (name - character):"]
-        lines += [f"  {v} - {ch}" for v, ch in VOICE_NAMES.items()]
+                 "", "All voices (F = female, M = male):"]
+        lines += [f"  {'F' if v in FEMALE_VOICES else 'M'} {v} - {ch}"
+                  for v, ch in VOICE_NAMES.items()]
         await u.message.reply_text("\n".join(lines)[:3800])
         return
     await u.message.reply_text(f"🔊 {name} - {VOICE_NAMES.get(name, 'your custom voice')}")
