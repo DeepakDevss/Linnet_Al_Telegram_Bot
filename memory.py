@@ -202,9 +202,9 @@ def count_ai(user_id, text: str) -> None:
     uid = str(user_id)
     with _LOCK:
         u = _DATA["users"].setdefault(uid, {})
-    ai = u.setdefault("ai", {})
-    for name in hits:
-        ai[name] = int(ai.get(name, 0)) + 1
+        ai = u.setdefault("ai", {})
+        for name in hits:
+            ai[name] = int(ai.get(name, 0)) + 1
     save()
 
 

@@ -908,6 +908,9 @@ NAME_OWNER_MATCH = bool(OWNER_NAMES)
 # drains the free daily quota and starves everyone else. A second message while a reply is
 # still in flight is simply skipped.
 USER_BUSY: set = set()
+# If a user's reply is still in flight and they send another message, wait this many seconds
+# for the first to finish (so their messages are answered IN ORDER) before giving up.
+USER_WAIT_MAX = float(os.environ.get("USER_WAIT_MAX", "25") or "25")
 # Optional per-user daily cap on AI answers (0 = no cap). A backstop against slow spam.
 USER_DAILY_CAP = int(os.environ.get("USER_DAILY_CAP", "0") or "0")
 _USER_DAY: dict = {}          # user_id -> (day_key, count)
@@ -979,6 +982,7 @@ THINKING_LEVEL = os.environ.get("THINKING_LEVEL", "minimal").strip().lower()
 THINKING_BUDGET = int(os.environ.get("THINKING_BUDGET", "-1") or "-1")   # -1 = do not send
 _THINKING_OK = True
 CHAT_LOG: dict = defaultdict(lambda: deque(maxlen=LOG_LINES))   # chat_id -> deque[(who, text)]
+_CHAT_SEEN: dict = {}          # chat_id -> epoch of its last logged line (for pruning)
 MEMBERS: dict = {}
 CHAT_LOCKS: dict = {}
 _SEND_TIMES: dict = defaultdict(deque)
@@ -1021,6 +1025,7 @@ def log_line(chat_id: int, who: str, text: str) -> None:
     text = text[:LOG_LINE_CHARS]
     if text:
         CHAT_LOG[chat_id].append((who, text))
+        _CHAT_SEEN[chat_id] = time.time()
 
 
 def recent_chat_block(chat_id: int, speaker: str) -> str:
@@ -3156,8 +3161,17 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     # Abuse guards (see USER_BUSY / USER_DAILY_CAP above).
     uid = getattr(u.effective_user, "id", 0) or 0
     if uid and uid in USER_BUSY:
-        log.info("user %s already has a reply in flight - skipping this one", uid)
-        return
+        # A reply is already in flight for this user. Do NOT silently drop their message - that
+        # loses what they typed (people send two quick lines all the time). Wait, briefly and
+        # bounded, for the previous reply to finish so messages are answered IN ORDER; only
+        # skip if it takes too long (a real flood is still stopped by USER_DAILY_CAP).
+        waited = 0.0
+        while uid in USER_BUSY and waited < USER_WAIT_MAX:
+            await asyncio.sleep(0.3)
+            waited += 0.3
+        if uid in USER_BUSY:
+            log.info("user %s still busy after %.0fs - skipping this message", uid, waited)
+            return
     if USER_DAILY_CAP:
         day = now_local().strftime("%Y-%m-%d")
         d, n = _USER_DAY.get(uid, (day, 0))
@@ -3776,49 +3790,60 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
+async def _cleanup_once() -> None:
+    """One housekeeping pass: drop idle per-chat state so memory does not grow forever."""
+    cutoff = time.time() - 7200
+    for k in list(_SEND_TIMES):
+        dq = _SEND_TIMES.get(k)
+        if not dq or dq[-1] < cutoff:
+            _SEND_TIMES.pop(k, None)
+    for k in list(CHAT_LOCKS):
+        lk = CHAT_LOCKS.get(k)
+        if lk is not None and not lk.locked() and k not in _SEND_TIMES:
+            CHAT_LOCKS.pop(k, None)
+    # The recent-chat transcript was never pruned - it grew by one entry for every chat the
+    # bot had EVER seen (a slow leak). Drop chats that have been quiet for a while.
+    for k in list(CHAT_LOG):
+        if _CHAT_SEEN.get(k, 0) < cutoff:
+            CHAT_LOG.pop(k, None)
+            _CHAT_SEEN.pop(k, None)
+    # The autonomous-action / abuse-guard dicts are keyed by (chat, kind) or user
+    # and were never pruned - they grew for the life of the process.
+    _today = now_local().strftime("%Y-%m-%d")
+    for k in list(_ACTION_LAST):
+        if _ACTION_LAST[k] < cutoff:
+            _ACTION_LAST.pop(k, None)
+    for k in list(_ACTION_DAY):
+        if _ACTION_DAY[k][0] != _today:
+            _ACTION_DAY.pop(k, None)
+    for k in list(_USER_DAY):
+        if _USER_DAY[k][0] != _today:
+            _USER_DAY.pop(k, None)
+    for k in list(_MEDIA_GROUPS):
+        _MEDIA_GROUPS.pop(k, None)      # an album still buffered an hour later is dead
+    for k in list(_ERR_TOLD):
+        if time.time() - _ERR_TOLD[k] > 3600:
+            _ERR_TOLD.pop(k, None)
+    for k in list(_SEARCH_CACHE):
+        if time.time() - _SEARCH_CACHE[k][0] > SEARCH_CACHE_TTL:
+            _SEARCH_CACHE.pop(k, None)
+    log.info("cleanup: locks=%s send_times=%s logs=%s actions=%s cache=%s",
+             len(CHAT_LOCKS), len(_SEND_TIMES), len(CHAT_LOG),
+             len(_ACTION_LAST), len(_SEARCH_CACHE))
+    # Retention purge (the automated job privacy-policy.md promises).
+    if MEM is not None and MEMORY_RETENTION_DAYS:
+        try:
+            MEM.purge_old(MEMORY_RETENTION_DAYS)
+        except Exception as e:  # noqa: BLE001
+            log.warning("retention purge failed: %s", e)
+
+
 async def _cleanup_loop() -> None:
-    """Periodically drop idle per-chat state so memory does not grow forever."""
+    """Periodically run the housekeeping pass."""
     while True:
         await asyncio.sleep(3600)
         try:
-            cutoff = time.time() - 7200
-            for k in list(_SEND_TIMES):
-                dq = _SEND_TIMES.get(k)
-                if not dq or dq[-1] < cutoff:
-                    _SEND_TIMES.pop(k, None)
-            for k in list(CHAT_LOCKS):
-                lk = CHAT_LOCKS.get(k)
-                if lk is not None and not lk.locked() and k not in _SEND_TIMES:
-                    CHAT_LOCKS.pop(k, None)
-            # The autonomous-action / abuse-guard dicts are keyed by (chat, kind) or user
-            # and were never pruned - they grew for the life of the process.
-            _today = now_local().strftime("%Y-%m-%d")
-            for k in list(_ACTION_LAST):
-                if _ACTION_LAST[k] < cutoff:
-                    _ACTION_LAST.pop(k, None)
-            for k in list(_ACTION_DAY):
-                if _ACTION_DAY[k][0] != _today:
-                    _ACTION_DAY.pop(k, None)
-            for k in list(_USER_DAY):
-                if _USER_DAY[k][0] != _today:
-                    _USER_DAY.pop(k, None)
-            for k in list(_MEDIA_GROUPS):
-                _MEDIA_GROUPS.pop(k, None)      # an album still buffered an hour later is dead
-            for k in list(_ERR_TOLD):
-                if time.time() - _ERR_TOLD[k] > 3600:
-                    _ERR_TOLD.pop(k, None)
-            for k in list(_SEARCH_CACHE):
-                if time.time() - _SEARCH_CACHE[k][0] > SEARCH_CACHE_TTL:
-                    _SEARCH_CACHE.pop(k, None)
-            log.info("cleanup: locks=%s send_times=%s logs=%s actions=%s cache=%s",
-                     len(CHAT_LOCKS), len(_SEND_TIMES), len(CHAT_LOG),
-                     len(_ACTION_LAST), len(_SEARCH_CACHE))
-            # Retention purge (the automated job privacy-policy.md promises).
-            if MEM is not None and MEMORY_RETENTION_DAYS:
-                try:
-                    MEM.purge_old(MEMORY_RETENTION_DAYS)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("retention purge failed: %s", e)
+            await _cleanup_once()
         except Exception as e:  # noqa: BLE001
             log.warning("cleanup failed: %s", e)
 
