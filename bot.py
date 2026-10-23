@@ -3276,10 +3276,12 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     and _LIVE_HINT_RE.search(text) and action_allowed(chat_id, "search")):
                 pre_research = await free_web_search(text[:160], RESEARCH_RESULTS)
                 if pre_research:
-                    ctx += ("\n\n=== LIVE WEB RESULTS (fetched just now) ===\n" + pre_research +
-                            "\nThese are CURRENT, as of right now. Use them for any figure, "
-                            "rate or date. You DO have live access - never say you cannot "
-                            "access the internet.")
+                    ctx += ("\n\n" + pre_research +
+                            "\n\nIMPORTANT: the data above was fetched LIVE just now - treat it "
+                            "as current fact. Use its actual numbers/figures in your answer. You "
+                            "DO have live access; never say you cannot reach the internet. If the "
+                            "data does not fully answer the question, give what it does show and "
+                            "say plainly what is missing.")
                     log.info("pre-flight research for %r -> %s chars", text[:50],
                              len(pre_research))
 
@@ -3308,11 +3310,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 if not results:
                     log.info("research for %r returned nothing", q[:60])
                     break
-                ctx2 = (ctx + f"\n\n=== LIVE WEB RESULTS for '{q}' (fetched just now) ===\n"
+                ctx2 = (ctx + f"\n\n=== LIVE RESULTS for '{q}' (fetched just now) ===\n"
                         + results +
                         "\nUse these for anything time-sensitive. If they do not answer the "
-                        "question, say so plainly rather than guessing. Do NOT mention that "
-                        "you searched, and never print the word [search].")
+                        "question, give what they do show and say plainly what is missing. Do "
+                        "NOT mention that you searched, and never print the word [search].")
                 ans2 = await ask_gemini(chat_id, prompt, ctx2, image, audio, doc)
                 if ans2:
                     ans = ans2
@@ -3331,9 +3333,10 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     log.info("answer claimed no live access - retrying with the live data")
                     ans2 = await ask_gemini(
                         chat_id, prompt,
-                        ctx + "\n\n=== LIVE WEB RESULTS (fetched just now) ===\n" + r2 +
-                        "\nThese are CURRENT. You DO have live access - answer using them and "
-                        "never say you cannot access the internet.",
+                        ctx + "\n\n" + r2 +
+                        "\n\nThe data above is CURRENT. You DO have live access - answer using "
+                        "it and never say you cannot access the internet. If it does not fully "
+                        "answer the question, give what it shows and say what is missing.",
                         image, audio, doc)
                     if ans2:
                         ans = ans2
@@ -3761,30 +3764,341 @@ _SEARCH_CACHE: dict = {}
 SEARCH_CACHE_TTL = float(os.environ.get("SEARCH_CACHE_TTL", "600") or "600")
 
 
-async def free_web_search(query: str, n: int = 5, deep: bool = True) -> str:
-    """Real-time lookup with NO API key, by combining keyless public sources.
+# ---- Query understanding: turn a chat sentence into a good search query ----------------
+# Words that add nothing to a query - stripped so "batao to gold ka aaj ka rate kya hai"
+# becomes "gold aaj rate" instead of being sent verbatim to the search engine.
+_Q_STOP = {
+    "batao", "bata", "bataao", "bataiye", "bolo", "bol", "kya", "kyu", "kyun", "kaise",
+    "kaisa", "kaisi", "hai", "hain", "ho", "ka", "ki", "ke", "ko", "se", "par", "to", "bhi",
+    "mera", "meri", "mujhe", "mujhko", "tum", "tumhe", "aap", "aapko", "please", "pls",
+    "plz", "tell", "me", "what", "is", "the", "of", "a", "an", "and", "karo", "kar", "do",
+    "dedo", "de", "dijiye", "chahiye", "ye", "yeh", "wo", "jaise", "ek", "kuch", "sir",
+    "bhai", "yaar", "thoda", "kitna", "kitne", "kaunsa", "konsa", "abhi",
+}
 
-    The Gemini free tier has NO search grounding, so this is the only way to get anything
-    current. Sources are tried in order and the first that returns something useful wins.
-    With deep=True we then open the top result and include its actual page text, which is
-    what makes answers about prices/scores/statistics accurate rather than guessed.
-    """
-    if not query:
+
+def _search_query(text: str) -> str:
+    """Turn a chat sentence into a compact search query."""
+    t = re.sub(r"[?!।,]+", " ", text or "")
+    toks = [w for w in re.split(r"\s+", t.strip()) if w]
+    kept = [w for w in toks if w.lower() not in _Q_STOP]
+    return (" ".join(kept).strip() or (text or "").strip())[:160]
+
+
+# Instrument detection for a structured finance lookup.
+_INSTRUMENTS = [
+    (("gold", "sona", "sone", "xau", "24k", "22k", "18k"), "gold"),
+    (("silver", "chandi", "xag"), "silver"),
+    (("bank nifty", "banknifty"), "banknifty"),
+    (("nifty", "nifty50"), "nifty"),
+    (("sensex", "bse"), "sensex"),
+    (("bitcoin", "btc"), "bitcoin"),
+    (("ethereum", "eth"), "ethereum"),
+    (("dollar", "usd", "usdinr"), "usd"),
+    (("euro", "eur"), "euro"),
+]
+_FIN_WORDS = ("gold", "silver", "sona", "chandi", "rate", "price", "bhav", "bhaav", "stock",
+              "share", "nifty", "sensex", "bitcoin", "btc", "ethereum", "crypto", "dollar",
+              "rupee", "usd", "inr", "euro", "forex", "index")
+_WX_WORDS = ("weather", "mausam", "temperature", "barish", "rain", "garmi", "thand",
+             "humidity", "forecast", "sardi", "dhoop")
+_NEWS_WORDS = ("news", "khabar", "headline", "headlines", "breaking", "update")
+# Time words that are not place names - stripped before geocoding a weather question.
+_TIME_WORDS = ("aaj", "kal", "parso", "today", "tomorrow", "tonight", "now")
+
+
+def _classify_query(q: str) -> str:
+    low = (q or "").lower()
+    if any(w in low for w in _WX_WORDS):
+        return "weather"
+    if any(w in low for w in _FIN_WORDS):
+        return "finance"
+    if any(w in low for w in _NEWS_WORDS):
+        return "news"
+    return "general"
+
+
+def _detect_instruments(q: str) -> list:
+    low = (q or "").lower()
+    return [name for keys, name in _INSTRUMENTS if any(k in low for k in keys)]
+
+
+# ---- Structured live feeds (keyless) ---------------------------------------------------
+_YH_HEADERS = {"User-Agent": _UA, "Accept": "application/json,text/plain,*/*"}
+
+
+async def _yahoo_quote(symbol: str):
+    """One live quote from Yahoo Finance's keyless chart endpoint."""
+    try:
+        r = await HTTP.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol),
+            params={"range": "1d", "interval": "1d"}, headers=_YH_HEADERS, timeout=6)
+        if r.status_code != 200:
+            return None
+        res = ((r.json().get("chart") or {}).get("result") or [])
+        meta = (res[0].get("meta") if res else None) or {}
+        price = meta.get("regularMarketPrice")
+        if price is None:
+            return None
+        return {"symbol": symbol,
+                "name": meta.get("shortName") or meta.get("longName") or symbol,
+                "price": float(price), "currency": meta.get("currency") or "",
+                "prev": meta.get("chartPreviousClose") or meta.get("previousClose")}
+    except Exception as e:  # noqa: BLE001
+        log.debug("yahoo %s failed: %s", symbol, str(e)[:80])
+        return None
+
+
+# Yahoo symbol -> Stooq symbol, for the CSV fallback.
+_STOOQ_MAP = {"XAUUSD=X": "xauusd", "XAGUSD=X": "xagusd", "GC=F": "gc.f", "SI=F": "si.f",
+              "^NSEI": "^nsei", "^BSESN": "^bse", "^NSEBANK": "^nsebank", "BTC-USD": "btcusd",
+              "ETH-USD": "ethusd", "USDINR=X": "usdinr", "EURINR=X": "eurinr"}
+
+
+async def _stooq_quote(symbol: str):
+    """Keyless CSV quote from Stooq, as a second opinion when Yahoo is unavailable."""
+    sym = _STOOQ_MAP.get(symbol)
+    if not sym:
+        return None
+    try:
+        r = await HTTP.get("https://stooq.com/q/l/",
+                           params={"s": sym, "f": "sd2t2ohlcv", "e": "csv"},
+                           headers=_UA_BOT, timeout=6)
+        if r.status_code != 200:
+            return None
+        rows = (r.text or "").strip().splitlines()
+        if len(rows) < 2:
+            return None
+        cols = rows[1].split(",")
+        if len(cols) < 7 or cols[6] in ("", "N/D"):
+            return None
+        return {"symbol": symbol, "name": symbol, "price": float(cols[6]),
+                "currency": "", "prev": None}
+    except Exception as e:  # noqa: BLE001
+        log.debug("stooq %s failed: %s", symbol, str(e)[:80])
+        return None
+
+
+async def _goldapi_quote(metal: str):
+    """Keyless spot metal price (XAU/XAG) from gold-api.com."""
+    try:
+        r = await HTTP.get("https://api.gold-api.com/price/" + metal,
+                           headers=_YH_HEADERS, timeout=6)
+        if r.status_code != 200:
+            return None
+        p = r.json().get("price")
+        if p is None:
+            return None
+        return {"symbol": metal, "name": metal, "price": float(p), "currency": "USD",
+                "prev": None}
+    except Exception as e:  # noqa: BLE001
+        log.debug("gold-api %s failed: %s", metal, str(e)[:80])
+        return None
+
+
+async def _quote(symbol: str):
+    """Best-effort live quote: Yahoo, then Stooq."""
+    for fn in (_yahoo_quote, _stooq_quote):
+        q = await fn(symbol)
+        if q and q.get("price"):
+            return q
+    return None
+
+
+async def _finance_lookup(query: str) -> str:
+    """Structured live prices for whatever instrument the query names."""
+    insts = _detect_instruments(query)
+    if not insts:
         return ""
-    ckey = (query.strip().lower()[:120], n, deep)
-    hit = _SEARCH_CACHE.get(ckey)
-    if hit and (time.time() - hit[0]) < SEARCH_CACHE_TTL:
-        log.info("research cache hit for %r", query[:50])
-        return hit[1]
+    sym_map = {"gold": ["XAUUSD=X", "GC=F"], "silver": ["XAGUSD=X", "SI=F"],
+               "nifty": ["^NSEI"], "banknifty": ["^NSEBANK"], "sensex": ["^BSESN"],
+               "bitcoin": ["BTC-USD"], "ethereum": ["ETH-USD"], "usd": ["USDINR=X"],
+               "euro": ["EURINR=X"]}
+    usdinr = None
+    if "gold" in insts or "silver" in insts:      # needed to show metal prices in rupees
+        uq = await _quote("USDINR=X")
+        usdinr = uq["price"] if uq else None
     lines = []
-    # Fetch DDG ONCE and reuse the same html for the snippets AND the deep page URLs. A
-    # second request just gave DDG another chance to answer 202 and kill deep mode.
-    html = await _ddg_lite_html(query)
-    if html:
-        lines = _ddg_lite_lines(html, n)
-        if lines:
-            log.info("research via ddg lite -> %s results", len(lines))
+    for inst in insts:
+        quote = None
+        for sym in sym_map.get(inst, []):
+            quote = await _quote(sym)
+            if quote:
+                break
+        if not quote and inst in ("gold", "silver"):
+            quote = await _goldapi_quote("XAU" if inst == "gold" else "XAG")
+        if not quote:
+            continue
+        p = quote["price"]
+        name = quote.get("name") or inst
+        if inst in ("gold", "silver"):
+            # USD per troy ounce -> rupees per 10 gram (1 troy oz = 31.1035 g)
+            if usdinr:
+                per_10g = p / 31.1035 * 10 * usdinr
+                lines.append(f"- {inst.upper()} (spot, live): US${p:,.2f} per troy ounce  =  "
+                             f"about Rs {per_10g:,.0f} per 10 gram (at USD/INR {usdinr:,.2f})")
+            else:
+                lines.append(f"- {inst.upper()} (spot, live): US${p:,.2f} per troy ounce")
+        else:
+            cur = quote.get("currency") or ""
+            lines.append(f"- {name} ({quote['symbol']}): {p:,.2f} {cur}".rstrip())
     if not lines:
+        return ""
+    return ("=== LIVE MARKET DATA (fetched just now, keyless feeds) ===\n"
+            + "\n".join(lines))
+
+
+# WMO weather codes -> plain words (Open-Meteo returns the code number).
+_WMO = {0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast", 45: "fog",
+        48: "rime fog", 51: "light drizzle", 53: "drizzle", 55: "dense drizzle",
+        61: "slight rain", 63: "rain", 65: "heavy rain", 71: "slight snow", 73: "snow",
+        75: "heavy snow", 80: "rain showers", 81: "rain showers", 82: "violent rain showers",
+        95: "thunderstorm", 96: "thunderstorm with hail", 99: "thunderstorm with heavy hail"}
+
+# A small built-in gazetteer so a common city never needs a network geocode (some hosts
+# block the Open-Meteo geocoding API). India-first, plus a few world majors.
+_CITY_COORDS = {
+    "delhi": (28.61, 77.21), "new delhi": (28.61, 77.21), "mumbai": (19.08, 72.88),
+    "kolkata": (22.57, 88.36), "chennai": (13.08, 80.27), "bengaluru": (12.97, 77.59),
+    "bangalore": (12.97, 77.59), "hyderabad": (17.39, 78.49), "pune": (18.52, 73.86),
+    "ahmedabad": (23.02, 72.57), "jaipur": (26.91, 75.79), "lucknow": (26.85, 80.95),
+    "kanpur": (26.45, 80.33), "nagpur": (21.15, 79.09), "indore": (22.72, 75.86),
+    "bhopal": (23.26, 77.41), "patna": (25.59, 85.14), "surat": (21.17, 72.83),
+    "vadodara": (22.31, 73.18), "chandigarh": (30.73, 76.78), "coimbatore": (11.02, 76.96),
+    "kochi": (9.93, 76.27), "guwahati": (26.14, 91.74), "bhubaneswar": (20.30, 85.82),
+    "raipur": (21.25, 81.63), "ranchi": (23.34, 85.31), "goa": (15.30, 74.12),
+    "varanasi": (25.32, 82.97), "agra": (27.18, 78.01), "amritsar": (31.63, 74.87),
+    "noida": (28.53, 77.39), "gurgaon": (28.46, 77.03), "gurugram": (28.46, 77.03),
+    "srinagar": (34.08, 74.80), "jodhpur": (26.24, 73.02), "nashik": (19.99, 73.79),
+    "thane": (19.22, 72.98), "visakhapatnam": (17.69, 83.22), "vizag": (17.69, 83.22),
+    "mysore": (12.30, 76.64), "mysuru": (12.30, 76.64), "dehradun": (30.32, 78.03),
+    "london": (51.51, -0.13), "new york": (40.71, -74.01), "dubai": (25.20, 55.27),
+    "singapore": (1.35, 103.82), "tokyo": (35.68, 139.69), "sydney": (-33.87, 151.21),
+    "toronto": (43.65, -79.38), "paris": (48.86, 2.35), "berlin": (52.52, 13.40),
+    "moscow": (55.76, 37.62), "shanghai": (31.23, 121.47), "hong kong": (22.32, 114.17),
+    "karachi": (24.86, 67.01), "lahore": (31.55, 74.34), "dhaka": (23.81, 90.41),
+    "kathmandu": (27.72, 85.32), "colombo": (6.93, 79.86), "bangkok": (13.76, 100.50),
+}
+
+
+async def _geocode(place: str):
+    """Find lat/lon for a place name: built-in gazetteer -> Wikipedia -> Open-Meteo."""
+    key = re.sub(r"\s+", " ", (place or "").lower()).strip()
+    if key in _CITY_COORDS:
+        lat, lon = _CITY_COORDS[key]
+        return {"name": place.title(), "country": "", "latitude": lat, "longitude": lon}
+    try:
+        r = await HTTP.get("https://en.wikipedia.org/w/api.php",
+                           params={"action": "query", "prop": "coordinates", "titles": place,
+                                   "format": "json"}, headers={"User-Agent": _UA_BOT}, timeout=6)
+        if r.status_code == 200:
+            for p in (((r.json().get("query") or {}).get("pages") or {})).values():
+                c = (p.get("coordinates") or [None])[0]
+                if c and c.get("lat") is not None:
+                    return {"name": p.get("title") or place, "country": "",
+                            "latitude": c["lat"], "longitude": c["lon"]}
+    except Exception as e:  # noqa: BLE001
+        log.debug("wiki geocode failed: %s", str(e)[:70])
+    try:
+        g = await HTTP.get("https://geocoding-api.open-meteo.com/v1/search",
+                           params={"name": place, "count": 1}, headers=_YH_HEADERS, timeout=6)
+        hits = ((g.json().get("results") if g.status_code == 200 else None) or [])
+        if hits:
+            return hits[0]
+    except Exception as e:  # noqa: BLE001
+        log.debug("open-meteo geocode failed: %s", str(e)[:70])
+    return None
+
+
+async def _weather_lookup(query: str) -> str:
+    """Live current weather via Open-Meteo (keyless). Geocodes the place named in the query."""
+    place = _search_query(query)
+    for w in list(_WX_WORDS) + list(_TIME_WORDS):
+        place = re.sub(w, " ", place, flags=re.I)
+    place = re.sub(r"\s+", " ", place).strip(" ,")
+    if not place:
+        place = "Delhi"
+    try:
+        loc = await _geocode(place)
+        if not loc:
+            return ""
+        city = loc.get("name") or place
+        country = loc.get("country") or ""
+        w = await HTTP.get("https://api.open-meteo.com/v1/forecast",
+                           params={"latitude": loc.get("latitude"),
+                                   "longitude": loc.get("longitude"),
+                                   "current": "temperature_2m,relative_humidity_2m,"
+                                              "apparent_temperature,weather_code,wind_speed_10m",
+                                   "daily": "temperature_2m_max,temperature_2m_min",
+                                   "forecast_days": 1, "timezone": "auto"},
+                           headers=_YH_HEADERS, timeout=6)
+        if w.status_code != 200:
+            return ""
+        j = w.json()
+        cur, daily = (j.get("current") or {}), (j.get("daily") or {})
+        if cur.get("temperature_2m") is None:
+            return ""
+        desc = _WMO.get(cur.get("weather_code"), "")
+        hi = (daily.get("temperature_2m_max") or [None])[0]
+        lo = (daily.get("temperature_2m_min") or [None])[0]
+        line = (f"- {city}{', ' + country if country else ''}: {cur['temperature_2m']}°C"
+                + (f" (feels like {cur['apparent_temperature']}°C)"
+                   if cur.get("apparent_temperature") is not None else "")
+                + (f", {desc}" if desc else "")
+                + (f"; today {lo} to {hi}°C" if hi is not None and lo is not None else "")
+                + (f"; humidity {cur['relative_humidity_2m']}%"
+                   if cur.get("relative_humidity_2m") is not None else "")
+                + (f"; wind {cur['wind_speed_10m']} km/h"
+                   if cur.get("wind_speed_10m") is not None else "") + ".")
+        return "=== LIVE WEATHER (Open-Meteo, fetched just now) ===\n" + line
+    except Exception as e:  # noqa: BLE001
+        log.debug("weather lookup failed: %s", str(e)[:80])
+        return ""
+
+
+async def _news_lookup(query: str, n: int = 5) -> str:
+    """Fresh headlines via Google News RSS (keyless). Titles often carry the exact figure."""
+    try:
+        r = await HTTP.get("https://news.google.com/rss/search",
+                           params={"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
+                           headers=_YH_HEADERS, timeout=7)
+        if r.status_code != 200:
+            return ""
+        out = []
+        for it in re.findall(r"<item>(.*?)</item>", r.text or "", re.S)[:n]:
+            tm = re.search(r"<title>(.*?)</title>", it, re.S)
+            if not tm:
+                continue
+            title = _strip_html(re.sub(r"<!\[CDATA\[|\]\]>", "", tm.group(1)))
+            dm = re.search(r"<pubDate>(.*?)</pubDate>", it, re.S)
+            when = dm.group(1).strip()[:22] if dm else ""
+            if title:
+                out.append(f"- {title}" + (f" ({when})" if when else ""))
+        if not out:
+            return ""
+        return "=== FRESH NEWS HEADLINES (Google News, just now) ===\n" + "\n".join(out)
+    except Exception as e:  # noqa: BLE001
+        log.debug("news lookup failed: %s", str(e)[:80])
+        return ""
+
+
+async def _wiki_lookup(query: str) -> str:
+    try:
+        res = await _wikipedia(query, 3)
+        if res:
+            return "=== FACTS (Wikipedia, just now) ===\n" + "\n".join(res)
+    except Exception as e:  # noqa: BLE001
+        log.debug("wiki lookup failed: %s", str(e)[:80])
+    return ""
+
+
+async def _web_lookup(query: str, n: int, deep: bool, use_wiki: bool = True) -> str:
+    """Web search (DDG lite) + an optional deep read of the top result pages."""
+    html = await _ddg_lite_html(query)
+    lines = _ddg_lite_lines(html, n) if html else []
+    if lines:
+        log.info("research via ddg lite -> %s results", len(lines))
+    if not lines and use_wiki:
         for fn in (_wikipedia, _ddg_instant):
             try:
                 res = await fn(query, n)
@@ -3796,7 +4110,7 @@ async def free_web_search(query: str, n: int = 5, deep: bool = True) -> str:
                 log.debug("research source %s failed: %s", fn.__name__, str(e)[:100])
     if not lines:
         return ""
-    body = "\n".join(lines)
+    body = "=== WEB RESULTS (just now) ===\n" + "\n".join(lines)
     if deep and RESEARCH_DEEP and html:
         try:
             # Every DDG result is wrapped in a redirect: //duckduckgo.com/l/?uddg=<encoded>.
@@ -3813,6 +4127,58 @@ async def free_web_search(query: str, n: int = 5, deep: bool = True) -> str:
                     log.info("research: read page %s (%s chars)", u[:50], len(txt))
         except Exception as e:  # noqa: BLE001
             log.debug("deep research failed: %s", str(e)[:100])
+    return body
+
+
+async def free_web_search(query: str, n: int = 5, deep: bool = True) -> str:
+    """Real-time lookup with NO API key, combining several keyless sources.
+
+    Order: a structured live feed (a price / a forecast) first - it is worth far more than a
+    generic page - then web search (+ a deep read of the top pages), then fresh news, then
+    encyclopedic facts. Every source is isolated, so one failure never kills the rest, and
+    the pieces are merged under clear headers so the model knows what each line is.
+    """
+    if not query:
+        return ""
+    q = _search_query(query) or query
+    kind = _classify_query(q)
+    # For a price question a search engine does better with a clean ENGLISH query
+    # ("gold rate today India") than with the chat sentence ("gold aaj rate").
+    sq = q
+    if kind == "finance":
+        insts = _detect_instruments(q)
+        if insts:
+            sq = " ".join(insts) + " rate today India"
+    ckey = (sq.strip().lower()[:120], n, deep)
+    hit = _SEARCH_CACHE.get(ckey)
+    if hit and (time.time() - hit[0]) < SEARCH_CACHE_TTL:
+        log.info("research cache hit for %r", sq[:50])
+        return hit[1]
+    sections = []
+    if kind == "finance":
+        s = await _finance_lookup(q)
+        if s:
+            sections.append(s)
+    elif kind == "weather":
+        s = await _weather_lookup(q)
+        if s:
+            sections.append(s)
+    if not sections:
+        # web + news concurrently - total wait is the slowest, not the sum. Wikipedia is a
+        # keyword search, so for a price question it returns junk - skip it there.
+        tasks = [_web_lookup(sq, n, deep, use_wiki=(kind in ("general", "news"))),
+                 _news_lookup(sq, 4)]
+        if kind in ("general", "news"):
+            tasks.append(_wiki_lookup(sq))
+        for s in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(s, str) and s.strip():
+                sections.append(s)
+    else:
+        # keep a little context - fresh headlines often carry the exact figure too
+        news = await _news_lookup(sq, 3)
+        if news:
+            sections.append(news)
+    body = "\n\n".join(sections).strip()
     if body:
         _SEARCH_CACHE[ckey] = (time.time(), body)
         if len(_SEARCH_CACHE) > 200:                  # keep the cache small
