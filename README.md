@@ -177,4 +177,15 @@ Deepak Devs
 
 ## License
 
-MIT — see `LICENSE.txt`.
+MIT — see `LICENSE.txt`. Every source file carries an `SPDX-License-Identifier: MIT` header.
+
+Third-party dependencies keep their own licenses — notably **python-telegram-bot** (LGPL-3.0),
+**google-genai** (Apache-2.0) and **httpx** (BSD-3-Clause). See `requirements.txt` and each
+package for the full text.
+
+## Privacy
+
+See `privacy-policy.md`, or send `/privacy` in the bot. In short: memory and reminders are
+stored **per user, keyed by Telegram ID**; message content is sent to Google Gemini (and Groq
+as a fallback) to produce replies; media is processed but not kept; `/memory` shows what is
+held and `/forget` deletes it.

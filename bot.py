@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Deepak Danodia (https://github.com/DeepakDevss)
 """
 VIDEX AI — Telegram Chatbot  (production-grade single file)
 ============================================================
@@ -2192,6 +2194,9 @@ def action_allowed(chat_id: int, kind: str) -> bool:
     return True
 
 
+PRIVACY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "privacy-policy.md")
+
+
 def safe_filename(name: str, fallback: str = "videx_file.txt") -> str:
     """A safe basename for an AI-written file - no paths, no surprises, known extension."""
     n = re.sub(r"[^A-Za-z0-9._ -]", "", str(name or "")).strip().strip(".")
@@ -2837,6 +2842,7 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/forget - delete everything I stored about you\n"
         "/remind 30m <kaam> - set a reminder (also: 'remind me in 2h to call mom')\n"
         "/reminders - list your reminders\n/delremind <id> - delete one\n"
+        "/privacy - how your data is handled\n"
         "/research <query> - look something up on the live web\n\n"
         "💡 Send text, a photo, a voice note or a PDF - the AI replies in your language.")
 # Command menus. Telegram's BotFather /setcommands can only publish ONE list for everyone,
@@ -2869,6 +2875,7 @@ PUBLIC_COMMANDS = [
     ("remind", "Set a reminder: /remind 30m drink water"),
     ("reminders", "List your reminders"),
     ("delremind", "Delete a reminder by its id"),
+    ("privacy", "How your data is handled"),
 ]
 OWNER_COMMANDS = [
     ("diag", "Diagnostics + live self-test"),
@@ -4364,12 +4371,55 @@ async def _goldapi_quote(metal: str):
         return None
 
 
+async def _goldprice_quote(metal: str):
+    """Keyless spot metal price from goldprice.org (XAU/XAG), USD per troy ounce.
+
+    A second metal source on purpose: gold-api.com and Yahoo are both blocked or flaky on
+    some hosts, and a single blocked feed was leaving the bot with no price at all.
+    """
+    try:
+        r = await HTTP.get("https://data-asg.goldprice.org/dbXRates/USD",
+                           headers=_YH_HEADERS, timeout=6)
+        if r.status_code != 200:
+            return None
+        items = (r.json() or {}).get("items") or []
+        if not items:
+            return None
+        p = items[0].get("xauPrice" if metal == "XAU" else "xagPrice")
+        if p is None:
+            return None
+        return {"symbol": metal, "name": metal, "price": float(p), "currency": "USD",
+                "prev": None}
+    except Exception as e:  # noqa: BLE001
+        log.debug("goldprice.org %s failed: %s", metal, str(e)[:80])
+        return None
+
+
+async def _erapi_quote(base: str = "USD", quote: str = "INR"):
+    """Keyless exchange rate from open.er-api.com (no key, no signup)."""
+    try:
+        r = await HTTP.get(f"https://open.er-api.com/v6/latest/{base}",
+                           headers=_YH_HEADERS, timeout=6)
+        if r.status_code != 200:
+            return None
+        p = ((r.json() or {}).get("rates") or {}).get(quote)
+        if p is None:
+            return None
+        return {"symbol": f"{base}{quote}", "name": f"{base}/{quote}",
+                "price": float(p), "currency": quote, "prev": None}
+    except Exception as e:  # noqa: BLE001
+        log.debug("er-api failed: %s", str(e)[:80])
+        return None
+
+
 async def _quote(symbol: str):
-    """Best-effort live quote: Yahoo, then Stooq."""
+    """Best-effort live quote: Yahoo, then Stooq, then the keyless FX feed."""
     for fn in (_yahoo_quote, _stooq_quote):
         q = await fn(symbol)
         if q and q.get("price"):
             return q
+    if symbol == "USDINR=X":
+        return await _erapi_quote("USD", "INR")
     return None
 
 
@@ -4394,7 +4444,8 @@ async def _finance_lookup(query: str) -> str:
             if quote:
                 break
         if not quote and inst in ("gold", "silver"):
-            quote = await _goldapi_quote("XAU" if inst == "gold" else "XAG")
+            metal = "XAU" if inst == "gold" else "XAG"
+            quote = await _goldapi_quote(metal) or await _goldprice_quote(metal)
         if not quote:
             continue
         p = quote["price"]
@@ -4414,6 +4465,38 @@ async def _finance_lookup(query: str) -> str:
         return ""
     return ("=== LIVE MARKET DATA (fetched just now, keyless feeds) ===\n"
             + "\n".join(lines))
+
+
+# A ₹/Rs figure inside a headline or snippet - "Gold rate today: ₹1,42,489 per 10 gram".
+_FIG_RE = re.compile(r"(?:₹|rs\.?\s?|inr\s?)(\d[\d,]*(?:\.\d+)?)", re.I)
+
+
+def _reported_figures(text: str, limit: int = 4) -> str:
+    """Pull the actual ₹ figures out of today's snippets.
+
+    When every structured price feed is blocked, the news and search snippets still carry the
+    number ("...₹1,42,489 per 10 gram"). Surfacing it - clearly attributed - beats the model
+    replying that it has no access.
+    """
+    seen, out = set(), []
+    for m in _FIG_RE.finditer(text or ""):
+        num = m.group(1)
+        try:
+            if float(num.replace(",", "")) < 100:      # "₹50 off" is not a rate
+                continue
+        except ValueError:
+            continue
+        if num in seen:
+            continue
+        seen.add(num)
+        line = text[max(0, m.start() - 70):m.end() + 50].replace("\n", " ").strip()
+        out.append("- " + re.sub(r"\s+", " ", line)[:170])
+        if len(out) >= limit:
+            break
+    if not out:
+        return ""
+    return ("=== FIGURES MENTIONED IN TODAY'S SOURCES (quote them with the source) ===\n"
+            + "\n".join(out))
 
 
 # WMO weather codes -> plain words (Open-Meteo returns the code number).
@@ -4646,6 +4729,10 @@ async def free_web_search(query: str, n: int = 5, deep: bool = True) -> str:
         news = await _news_lookup(sq, 3)
         if news:
             sections.append(news)
+    if kind == "finance" and not any("LIVE MARKET DATA" in s for s in sections):
+        figs = _reported_figures("\n".join(sections))
+        if figs:
+            sections.append(figs)
     body = "\n\n".join(sections).strip()
     if body:
         _SEARCH_CACHE[ckey] = (time.time(), body)
@@ -4938,6 +5025,26 @@ async def cmd_voicelist(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(body[:3800])
 
 
+async def cmd_privacy(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the privacy policy. Read from the repo file so it is always the current version."""
+    text = ""
+    try:
+        with open(PRIVACY_FILE, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+    except Exception as e:  # noqa: BLE001
+        log.debug("privacy file read failed: %s", str(e)[:80])
+    if not text:
+        text = (
+            "**VIDEX — Privacy (summary)**\n\n"
+            "I store your Telegram ID, first name, username, language, message counters, the "
+            "notes you ask me to remember, and your reminders — separately for each user. "
+            "Messages go to Google Gemini (and Groq as a fallback) to produce replies. Media is "
+            "processed, not kept. Use /memory to see what I hold and /forget to delete it.\n\n"
+            "Full policy: see `privacy-policy.md` in the project repository.")
+    for chunk in split_text(text, 3500):
+        await _safe_send(u, c, md_to_html(chunk), chunk)
+
+
 async def cmd_remind(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """Set a reminder from a command: /remind 30m drink water  (or  30m | drink water)."""
     chat_id = u.effective_chat.id
@@ -5170,6 +5277,7 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("remind", cmd_remind))
     app.add_handler(CommandHandler("reminders", cmd_reminders))
     app.add_handler(CommandHandler("delremind", cmd_delremind))
+    app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(CommandHandler("ai", cmd_ai))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("welcome", cmd_welcome))

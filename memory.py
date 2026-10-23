@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Deepak Danodia (https://github.com/DeepakDevss)
 """VIDEX AI — long-term memory store (separate file).
 
 Keeps a small, growing profile for every user and every chat the bot has seen:
