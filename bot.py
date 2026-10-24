@@ -2845,7 +2845,7 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/forget - delete everything I stored about you\n"
         "/remind 30m <kaam> - set a reminder (also: 'remind me in 2h to call mom')\n"
         "/reminders - list your reminders\n/delremind <id> - delete one\n"
-        "/privacy - how your data is handled\n"
+        "/privacy - how your data is handled\n/feed <rss-url> - read an RSS/Atom feed\n"
         "/research <query> - look something up on the live web\n\n"
         "💡 Send text, a photo, a voice note, a PDF or a YouTube link - the AI replies in "
         "your language.")
@@ -2880,6 +2880,7 @@ PUBLIC_COMMANDS = [
     ("reminders", "List your reminders"),
     ("delremind", "Delete a reminder by its id"),
     ("privacy", "How your data is handled"),
+    ("feed", "Read an RSS/Atom feed: /feed <url>"),
 ]
 OWNER_COMMANDS = [
     ("diag", "Diagnostics + live self-test"),
@@ -3614,6 +3615,20 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                             "\n\nThe user shared this link - read it and answer about it. Never "
                             "say you cannot open links.")
                     log.info("link read for chat %s -> %s chars", chat_id, len(link_text))
+                    # Archive a one-line summary of what they shared, so "wo article kya tha"
+                    # works days later (it rides along in the user's memory notes).
+                    if MEM is not None:
+                        try:
+                            _ttl = ""
+                            for _ln in link_text.splitlines():
+                                _ln = _ln.strip()
+                                if _ln.startswith(("title: ", "YouTube video: ", "📰 Feed")):
+                                    _ttl = _ln.split(":", 1)[-1].strip()[:120]
+                                    break
+                            if _ttl:
+                                MEM.note(u.effective_user.id, "shared link: " + _ttl)
+                        except Exception as e:  # noqa: BLE001
+                            log.debug("link note failed: %s", e)
 
             # ---- PRE-FLIGHT RESEARCH -------------------------------------------
             # The model frequently answers a live-data question with "I cannot access the
@@ -4070,6 +4085,171 @@ _DDG_LAST = 0.0          # epoch of the last DDG request (for the throttle below
 _DDG_MIN_GAP = 1.5       # minimum seconds between two DDG requests
 
 
+# ---- Resilient fetch layer ---------------------------------------------------------------
+# Every outbound page/feed request goes through here. The goal: a transient hiccup (a 202 from
+# DuckDuckGo, a 429, a slow host) must never become a failed answer, and the bot must never
+# hammer one host into blocking it.
+#   * a small pool of realistic browser User-Agents, chosen PER HOST so a host always sees the
+#     same "browser" (a consistent identity looks human; a fresh random one every time does not)
+#   * a COMPLETE browser header set - a User-Agent alone is a giveaway
+#   * per-host pacing: a minimum gap between requests to the same host
+#   * retry ONLY transient failures, with capped exponential backoff + full jitter
+#     (401/404/410 are permanent - retrying them is pure waste)
+#   * Retry-After honoured when the server sends it
+#   * a per-host circuit breaker, so a host that keeps failing is skipped for a cooldown
+#   * a hard deadline per call, so one slow host can never hold up the reply
+# This is ordinary polite HTTP - not bot-detection evasion. No proxies, no CAPTCHA solving.
+_UA_POOL = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.6 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+)
+_HOST_LAST: dict = {}          # host -> monotonic time of the last request to it
+_HOST_FAILS: dict = {}         # host -> [consecutive_failures, breaker_opened_at]
+HOST_MIN_GAP = float(os.environ.get("HOST_MIN_GAP", "0.8") or "0.8")
+BREAKER_FAILS = int(os.environ.get("BREAKER_FAILS", "4") or "4")
+BREAKER_COOLDOWN = float(os.environ.get("BREAKER_COOLDOWN", "120") or "120")
+_RETRY_STATUS = {202, 408, 425, 429, 500, 502, 503, 504}
+_PERMANENT_STATUS = {400, 401, 404, 410, 451}
+
+
+def _ua_for(host: str) -> str:
+    """Stable per host: the same host always sees the same browser identity."""
+    return _UA_POOL[sum(ord(c) for c in (host or "")) % len(_UA_POOL)]
+
+
+def _browser_headers(url: str, extra=None) -> dict:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    wiki = "wikipedia.org" in host or "wikimedia.org" in host
+    h = {
+        "User-Agent": _UA_BOT if wiki else _ua_for(host),
+        "Accept": ("application/json,text/plain,*/*" if (extra or {}).get("Accept")
+                   else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        "Accept-Language": "en-IN,en-GB;q=0.9,en;q=0.8,hi;q=0.7",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _breaker_allows(host: str) -> bool:
+    f = _HOST_FAILS.get(host)
+    if not f:
+        return True
+    fails, opened = f
+    if opened and (time.monotonic() - opened) >= BREAKER_COOLDOWN:
+        _HOST_FAILS.pop(host, None)          # half-open: let one probe through
+        return True
+    return fails < BREAKER_FAILS
+
+
+def _breaker_record(host: str, ok: bool) -> None:
+    if ok:
+        _HOST_FAILS.pop(host, None)
+        return
+    fails, opened = _HOST_FAILS.get(host, [0, 0.0])
+    fails += 1
+    _HOST_FAILS[host] = [fails, time.monotonic() if fails >= BREAKER_FAILS else opened]
+
+
+async def _host_wait(host: str) -> None:
+    """A minimum gap between hits on the same host, with a little jitter."""
+    gap = HOST_MIN_GAP - (time.monotonic() - _HOST_LAST.get(host, 0.0))
+    if gap > 0:
+        await asyncio.sleep(gap + random.random() * 0.25)
+    _HOST_LAST[host] = time.monotonic()
+
+
+def _backoff(r, attempt: int) -> float:
+    """Server hint first, else capped exponential backoff with full jitter."""
+    try:
+        ra = float((r.headers.get("retry-after") or "").strip())
+    except Exception:  # noqa: BLE001
+        ra = 0.0
+    cap = min(8.0, 0.6 * (2 ** attempt))
+    delay = min(ra, cap) if ra else cap
+    return max(0.0, delay * (0.5 + random.random()))
+
+
+async def _fetch(url: str, *, headers=None, params=None, timeout: float = 12, attempts: int = 3,
+                 deadline: float = 22, retry_blocked: bool = False):
+    """GET with pacing, backoff, jitter and a per-host breaker. Returns a Response, or None."""
+    if not url or not url.startswith("http"):
+        return None
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if not host or not _breaker_allows(host):
+        log.debug("fetch: skipped %s", host or url[:40])
+        return None
+    started = time.monotonic()
+    hdrs = _browser_headers(url, headers)
+    for attempt in range(max(1, attempts)):
+        if time.monotonic() - started > deadline:
+            break
+        await _host_wait(host)
+        try:
+            r = await HTTP.get(url, headers=hdrs, params=params, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            _breaker_record(host, False)
+            if attempt + 1 < attempts:
+                await asyncio.sleep(min(4.0, 0.5 * (2 ** attempt)) * (0.5 + random.random()))
+                continue
+            log.debug("fetch failed (%s): %s", host, str(e)[:80])
+            return None
+        if r.status_code in _RETRY_STATUS and attempt + 1 < attempts:
+            _breaker_record(host, False)
+            await asyncio.sleep(_backoff(r, attempt))
+            continue
+        if r.status_code in _PERMANENT_STATUS and not (retry_blocked and attempt == 0):
+            _breaker_record(host, False)
+            log.debug("fetch: permanent %s from %s", r.status_code, host)
+            return None
+        if r.status_code >= 400:
+            _breaker_record(host, False)
+            return None
+        _breaker_record(host, True)
+        return r
+    _breaker_record(host, False)
+    return None
+
+
+def _og_meta(h: str) -> str:
+    """The Open Graph / meta block of a page.
+
+    This is what makes a social link readable at all: Instagram, X, Facebook, Reddit and
+    LinkedIn serve a JavaScript-only body, but they all still publish og:title/description in
+    the raw HTML - which is what a link preview is built from.
+    """
+    def meta(prop):
+        for pat in (rf'<meta[^>]+(?:property|name)=["\']{prop}["\'][^>]+content=["\'](.*?)["\']',
+                    rf'<meta[^>]+content=["\'](.*?)["\'][^>]+(?:property|name)=["\']{prop}["\']'):
+            m = re.search(pat, h, re.S | re.I)
+            if m and m.group(1).strip():
+                return html.unescape(_strip_html(m.group(1)))
+        return ""
+    bits = []
+    t = meta("og:title") or meta("twitter:title")
+    if not t:
+        m = re.search(r"(?is)<title[^>]*>(.*?)</title>", h)
+        t = html.unescape(_strip_html(m.group(1))) if m else ""
+    d = meta("og:description") or meta("twitter:description") or meta("description")
+    site = meta("og:site_name")
+    if t:
+        bits.append("title: " + re.sub(r"\s+", " ", t)[:200])
+    if site:
+        bits.append("site: " + site[:60])
+    if d:
+        bits.append("summary: " + re.sub(r"\s+", " ", d)[:500])
+    return "\n".join(bits)
+
+
 def _strip_html(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s or "")).strip()
 
@@ -4189,21 +4369,24 @@ async def _read_page(url: str, limit: int = 1200) -> str:
         log.debug("research: refusing a private-looking URL %s", host)
         return ""
     try:
-        # Wikimedia rejects a browser UA (403 "respect our robot policy") and needs the
-        # descriptive bot UA; almost every other site wants a normal browser UA.
-        ua = _UA_BOT if ("wikipedia.org" in host or "wikimedia.org" in host) else _UA
-        r = await HTTP.get(url, headers={"User-Agent": ua}, timeout=12)
-        if r.status_code != 200 or "html" not in (r.headers.get("content-type") or ""):
+        r = await _fetch(url, timeout=12)
+        if r is None or "html" not in (r.headers.get("content-type") or "").lower():
             return ""
-        h = re.sub(r"(?is)<(script|style|nav|header|footer|aside)[^>]*>.*?</\1>", " ", r.text or "")
+        raw = r.text or ""
+        meta = _og_meta(raw)
+        h = re.sub(r"(?is)<(script|style|nav|header|footer|aside)[^>]*>.*?</\1>", " ", raw)
         h = re.sub(r"(?is)<br\s*/?>|</p>|</div>|</li>|</h[1-6]>", "\n", h)
-        txt = _strip_html(h)
-        txt = re.sub(r"\s{2,}", " ", txt)
+        txt = re.sub(r"\s{2,}", " ", _strip_html(h)).strip()
         # Keep the densest window: pages start with menus and boilerplate.
         if len(txt) > limit:
             start = max(0, len(txt) // 6)
             txt = txt[start:start + limit]
-        return txt.strip()[:limit]
+        txt = txt.strip()[:limit]
+        # A JavaScript-only page (social posts) has almost no body - the meta block IS the
+        # content, so prefer it there and lead with it elsewhere.
+        if len(txt) < 200 and meta:
+            return meta[:limit]
+        return (meta + "\n\n" + txt)[:limit] if meta else txt
     except Exception as e:  # noqa: BLE001
         log.debug("page read failed (%s): %s", url[:60], str(e)[:80])
         return ""
@@ -4301,6 +4484,50 @@ async def _youtube_context(url: str) -> str:
     return "\n".join(out)
 
 
+# ---- RSS / Atom feeds ------------------------------------------------------------------
+# Any feed URL the person shares (or /feed <url>) is read directly - keyless, no reader app.
+_FEED_HINT_RE = re.compile(r"(\.(?:rss|atom|xml)(?:$|[?#])|/feed/?$|/rss/?$|feeds\.)", re.I)
+
+
+def _is_feed_url(url: str) -> bool:
+    return bool(_FEED_HINT_RE.search((url or "").lower()))
+
+
+def _parse_feed(xml: str, n: int = 8) -> list:
+    """Return [(title, link, date)] from RSS <item> or Atom <entry>."""
+    out = []
+    blocks = re.findall(r"(?is)<item[ >].*?</item>", xml or "") or \
+             re.findall(r"(?is)<entry[ >].*?</entry>", xml or "")
+    for b in blocks[:n]:
+        t = re.search(r"(?is)<title[^>]*>(.*?)</title>", b)
+        title = html.unescape(re.sub(r"<!\[CDATA\[|\]\]>", "", t.group(1))).strip() if t else ""
+        title = re.sub(r"\s+", " ", _strip_html(title))[:160]
+        l = re.search(r"(?is)<link[^>]*href=[\"\']([^\"\']+)[\"\']", b) or \
+            re.search(r"(?is)<link[^>]*>(.*?)</link>", b)
+        link = html.unescape((l.group(1) if l else "")).strip()[:200]
+        d = re.search(r"(?is)<(?:pubDate|updated|published|dc:date)>(.*?)</", b)
+        date = re.sub(r"\s+", " ", d.group(1)).strip()[:32] if d else ""
+        if title:
+            out.append((title, link, date))
+    return out
+
+
+async def _read_feed(url: str, n: int = 8) -> str:
+    """Read an RSS/Atom feed and return its latest items, ready for the model."""
+    if not url or not url.startswith("http"):
+        return ""
+    r = await _fetch(url, timeout=10, headers={"Accept": "application/rss+xml,application/xml,*/*"})
+    if r is None:
+        return ""
+    items = _parse_feed(r.text or "", n)
+    if not items:
+        return ""
+    lines = []
+    for title, link, date in items:
+        lines.append(f"- {title}" + (f"  ({date})" if date else "") + (f"\n  {link}" if link else ""))
+    return f"=== FEED (latest {len(items)}) ===\n" + "\n".join(lines)
+
+
 async def _read_links(text: str, limit: int = 2) -> str:
     """Fetch the pages behind links the user shared, so the model can actually read them."""
     urls = []
@@ -4315,6 +4542,11 @@ async def _read_links(text: str, limit: int = 2) -> str:
             urls.append(u)
     out = []
     for u in urls[:limit]:
+        if _is_feed_url(u):
+            feed = await _read_feed(u, 8)
+            if feed:
+                out.append(f"- {u}\n{feed}")
+                continue
         if _yt_video_id(u):
             yt = await _youtube_context(u)
             if yt:
@@ -4506,6 +4738,25 @@ async def _erapi_quote(base: str = "USD", quote: str = "INR"):
         return None
 
 
+async def _binance_quote(pair: str):
+    """Keyless 24h crypto quote from Binance's public API (no key, generous limits)."""
+    try:
+        r = await _fetch("https://api.binance.com/api/v3/ticker/24hr", params={"symbol": pair},
+                         timeout=6, headers={"Accept": "application/json"})
+        if r is None:
+            return None
+        j = r.json() or {}
+        p = j.get("lastPrice")
+        if p is None:
+            return None
+        prev = float(j.get("prevClosePrice") or 0) or None
+        return {"symbol": pair, "name": pair, "price": float(p), "currency": "USDT",
+                "prev": prev}
+    except Exception as e:  # noqa: BLE001
+        log.debug("binance %s failed: %s", pair, str(e)[:80])
+        return None
+
+
 async def _quote(symbol: str):
     """Best-effort live quote: Yahoo, then Stooq, then the keyless FX feed."""
     for fn in (_yahoo_quote, _stooq_quote):
@@ -4530,13 +4781,17 @@ async def _finance_lookup(query: str) -> str:
     if "gold" in insts or "silver" in insts:      # needed to show metal prices in rupees
         uq = await _quote("USDINR=X")
         usdinr = uq["price"] if uq else None
+    binance_map = {"bitcoin": "BTCUSDT", "ethereum": "ETHUSDT"}
     lines = []
     for inst in insts:
         quote = None
-        for sym in sym_map.get(inst, []):
-            quote = await _quote(sym)
-            if quote:
-                break
+        if inst in binance_map:
+            quote = await _binance_quote(binance_map[inst])   # fastest, most reliable for crypto
+        if not quote:
+            for sym in sym_map.get(inst, []):
+                quote = await _quote(sym)
+                if quote:
+                    break
         if not quote and inst in ("gold", "silver"):
             metal = "XAU" if inst == "gold" else "XAG"
             quote = await _goldapi_quote(metal) or await _goldprice_quote(metal)
@@ -4704,10 +4959,10 @@ async def _weather_lookup(query: str) -> str:
 async def _news_lookup(query: str, n: int = 5) -> str:
     """Fresh headlines via Google News RSS (keyless). Titles often carry the exact figure."""
     try:
-        r = await HTTP.get("https://news.google.com/rss/search",
-                           params={"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
-                           headers=_YH_HEADERS, timeout=7)
-        if r.status_code != 200:
+        r = await _fetch("https://news.google.com/rss/search",
+                         params={"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
+                         timeout=7)
+        if r is None:
             return ""
         out = []
         for it in re.findall(r"<item>(.*?)</item>", r.text or "", re.S)[:n]:
@@ -5119,6 +5374,29 @@ async def cmd_voicelist(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(body[:3800])
 
 
+async def cmd_feed(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Read any RSS/Atom feed: /feed https://example.com/feed"""
+    chat_id = u.effective_chat.id
+    arg = " ".join(c.args or []).strip()
+    if not arg.startswith("http"):
+        await _send_plain(c.bot, chat_id,
+                          "Format: /feed <rss-url>\n"
+                          "Example: /feed https://news.google.com/rss/search?q=ai")
+        return
+    try:
+        await c.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:  # noqa: BLE001
+        pass
+    feed = await _read_feed(arg, 8)
+    if not feed:
+        await _send_plain(c.bot, chat_id,
+                          "Us feed se kuch nahi mila. URL check karo (RSS/Atom hona chahiye).")
+        return
+    body = feed.replace("=== FEED (latest", "📰 Feed (latest").replace(") ===", ")")
+    for chunk in split_text(body, 3500):
+        await _send_plain(c.bot, chat_id, chunk)
+
+
 async def cmd_privacy(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the privacy policy. Read from the repo file so it is always the current version."""
     text = ""
@@ -5372,6 +5650,7 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("reminders", cmd_reminders))
     app.add_handler(CommandHandler("delremind", cmd_delremind))
     app.add_handler(CommandHandler("privacy", cmd_privacy))
+    app.add_handler(CommandHandler("feed", cmd_feed))
     app.add_handler(CommandHandler("ai", cmd_ai))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("welcome", cmd_welcome))

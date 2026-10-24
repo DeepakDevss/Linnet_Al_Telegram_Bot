@@ -23,8 +23,12 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Reads photos, documents, voice notes, and audio
 - Understands plain requests with no command — say "make me a report" and it attaches the file, or "draw a logo" and it makes the image
 - Sets reminders and delivers them on time ("remind me in 2h to call mom"), with no external service
-- Reads a link you paste and answers about the page — including YouTube links (title, channel, description and public captions), with no browser and no key
-- Looks things up live (prices, weather, news) with no API key
+- Reads a link you paste and answers about the page — news, blogs, and social links (Instagram, X, Reddit, Facebook all expose Open Graph data, which is read directly)
+- YouTube links too: title, channel, description and public captions — no browser, no key
+- Fetches politely and resiliently: per-host pacing, backoff + jitter on transient errors, and a per-host circuit breaker, so a site never blocks the bot
+- Reads RSS/Atom feeds — send a feed URL, or `/feed <url>`, and get its latest items
+- Looks things up live (prices, weather, news) with no API key — gold, silver, USD/INR, and crypto (Binance), each with several fallback sources
+- Remembers the links you share, so you can ask about them later
 - Does exact arithmetic on request
 - Sends voice replies using text-to-speech
 - Picks a fitting emoji reaction for each message
